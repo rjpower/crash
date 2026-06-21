@@ -1,0 +1,318 @@
+//! Interpreter state shared across the shell executor and all commands.
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::clock::Clock;
+use crate::net::VirtualNet;
+use crate::vfs::Vfs;
+
+/// A bash array value. Indexed arrays are sparse (`arr[5]=x` on an empty array is legal),
+/// so unset slots are `None`. Associative arrays preserve sorted key order (bash uses an
+/// unspecified hash order; sorted is deterministic and good enough for our checks).
+#[derive(Clone, Debug)]
+pub enum ArrayVal {
+    Indexed(Vec<Option<String>>),
+    Assoc(BTreeMap<String, String>),
+}
+
+/// A simulated background job (started with `&`). Because there is no real concurrency,
+/// a job is just a captured AST that will be run-to-completion when the scheduler decides
+/// to (e.g. on `wait`, or when the foreground needs its effects). For most tasks the body
+/// is run immediately and synchronously, which is indistinguishable for file-state checks.
+pub struct Job {
+    pub id: u32,
+    pub cmd: String,
+    pub done: bool,
+    pub status: i32,
+}
+
+pub struct Interp {
+    pub vfs: Vfs,
+    pub clock: Clock,
+    pub net: VirtualNet,
+    /// shell + environment variables (we don't distinguish exported vs not for simplicity,
+    /// except that `env`/child python only sees exported ones, tracked in `exported`)
+    pub vars: HashMap<String, String>,
+    /// bash arrays (indexed + associative), keyed by variable name. A name present here is an
+    /// array; it shadows any scalar `vars` entry of the same name for `${name[...]}` access.
+    pub arrays: HashMap<String, ArrayVal>,
+    pub exported: std::collections::BTreeSet<String>,
+    pub cwd: String,
+    pub funcs: HashMap<String, crate::shell::Node>,
+    /// `$?`
+    pub last_status: i32,
+    /// positional parameters `$1 $2 ... $@`
+    pub positional: Vec<String>,
+    /// `set -e` / `set -u` / `set -x`
+    pub opt_errexit: bool,
+    pub opt_nounset: bool,
+    pub opt_xtrace: bool,
+    /// `set -o pipefail`
+    pub opt_pipefail: bool,
+    pub jobs: Vec<Job>,
+    next_job_id: u32,
+    /// recursion / loop-control signaling
+    pub loop_break: u32,
+    pub loop_continue: u32,
+    pub returning: Option<i32>,
+    pub exiting: Option<i32>,
+    /// depth of "condition" contexts (if/while/&&/||/!) where `set -e` is suppressed
+    pub cond_depth: u32,
+    /// effective uid (for permission-ish checks / `id`)
+    pub uid: u32,
+    /// persistent input stream + cursor for `read` inside `while read…; done < file`
+    pub input_stream: Vec<u8>,
+    pub input_pos: usize,
+    /// trace of every external command name executed (telemetry for "what did we cover")
+    pub cmd_trace: Vec<String>,
+    /// commands requested that we don't implement (coverage gaps)
+    pub unsupported: Vec<String>,
+    /// command names that ran as `Trust::NoOp` (ignored — e.g. apt-get) during this run
+    pub trust_noop: std::collections::BTreeSet<String>,
+    /// command names that ran as `Trust::Partial` (subset impl — e.g. jq/sed) during this run
+    pub trust_partial: std::collections::BTreeSet<String>,
+}
+
+impl Interp {
+    pub fn new() -> Self {
+        let mut vars = HashMap::new();
+        vars.insert("HOME".into(), "/root".into());
+        vars.insert("PATH".into(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+        vars.insert("PWD".into(), "/".into());
+        vars.insert("SHELL".into(), "/bin/bash".into());
+        vars.insert("TERM".into(), "xterm-256color".into());
+        vars.insert("USER".into(), "root".into());
+        vars.insert("HOSTNAME".into(), "sandbox".into());
+        vars.insert("LANG".into(), "C.UTF-8".into());
+        vars.insert("IFS".into(), " \t\n".into());
+        let mut exported = std::collections::BTreeSet::new();
+        for k in ["HOME", "PATH", "PWD", "SHELL", "TERM", "USER", "HOSTNAME", "LANG"] {
+            exported.insert(k.to_string());
+        }
+        Interp {
+            vfs: Vfs::new(),
+            clock: Clock::new(),
+            net: VirtualNet::new(),
+            vars,
+            arrays: HashMap::new(),
+            exported,
+            cwd: "/".to_string(),
+            funcs: HashMap::new(),
+            last_status: 0,
+            positional: Vec::new(),
+            opt_errexit: false,
+            opt_nounset: false,
+            opt_xtrace: false,
+            opt_pipefail: false,
+            jobs: Vec::new(),
+            next_job_id: 1,
+            loop_break: 0,
+            loop_continue: 0,
+            returning: None,
+            exiting: None,
+            cond_depth: 0,
+            uid: 0,
+            input_stream: Vec::new(),
+            input_pos: 0,
+            cmd_trace: Vec::new(),
+            unsupported: Vec::new(),
+            trust_noop: std::collections::BTreeSet::new(),
+            trust_partial: std::collections::BTreeSet::new(),
+        }
+    }
+
+    pub fn get_var(&self, name: &str) -> Option<String> {
+        match name {
+            "?" => Some(self.last_status.to_string()),
+            "$" => Some("1234".to_string()), // deterministic fake PID
+            "#" => Some(self.positional.len().to_string()),
+            "PWD" => Some(self.cwd.clone()),
+            "@" | "*" => Some(self.positional.join(" ")),
+            _ => {
+                if let Ok(n) = name.parse::<usize>() {
+                    if n == 0 {
+                        return Some("shellsim".to_string());
+                    }
+                    return self.positional.get(n - 1).cloned();
+                }
+                // A bare reference to an array name yields element 0 (`$arr` == `${arr[0]}`).
+                if self.arrays.contains_key(name) {
+                    return Some(self.array_get(name, "0").unwrap_or_default());
+                }
+                self.vars.get(name).cloned()
+            }
+        }
+    }
+
+    pub fn set_var(&mut self, name: &str, val: impl Into<String>) {
+        let val = val.into();
+        if name == "PWD" {
+            self.cwd = val.clone();
+        }
+        // A plain scalar assignment to an array name in bash sets element 0; we instead treat it
+        // as a fresh scalar (drop the array) — the common case in our scripts and lower-risk.
+        self.arrays.remove(name);
+        self.vars.insert(name.to_string(), val);
+    }
+
+    pub fn export(&mut self, name: &str) {
+        self.exported.insert(name.to_string());
+    }
+
+    // ===================== arrays =====================
+
+    pub fn is_array(&self, name: &str) -> bool {
+        self.arrays.contains_key(name)
+    }
+
+    /// Ensure `name` exists as an *indexed* array. If it was a plain scalar, bash promotes it
+    /// so that the old scalar becomes element 0 (`x=1; x[2]=3` ⇒ x[0]=1).
+    fn ensure_indexed(&mut self, name: &str) {
+        if !self.arrays.contains_key(name) {
+            let mut v: Vec<Option<String>> = Vec::new();
+            if let Some(s) = self.vars.get(name).cloned() {
+                v.push(Some(s));
+            }
+            self.arrays.insert(name.to_string(), ArrayVal::Indexed(v));
+        }
+    }
+
+    /// Ensure `name` exists as an *associative* array (created empty if absent).
+    pub fn declare_assoc(&mut self, name: &str) {
+        if !matches!(self.arrays.get(name), Some(ArrayVal::Assoc(_))) {
+            self.arrays.insert(name.to_string(), ArrayVal::Assoc(BTreeMap::new()));
+        }
+    }
+
+    /// Ensure `name` exists as an indexed array (created empty if absent).
+    pub fn declare_indexed(&mut self, name: &str) {
+        self.ensure_indexed(name);
+    }
+
+    /// Replace the whole array at `name` with the given element list (indexed).
+    pub fn set_array(&mut self, name: &str, elems: Vec<String>) {
+        self.vars.remove(name);
+        self.arrays
+            .insert(name.to_string(), ArrayVal::Indexed(elems.into_iter().map(Some).collect()));
+    }
+
+    /// Append elements to the end of an indexed array (creating/promoting as needed). For an
+    /// associative array, callers should use `array_set` per key; this is indexed-only.
+    pub fn array_append(&mut self, name: &str, elems: Vec<String>) {
+        self.ensure_indexed(name);
+        if let Some(ArrayVal::Indexed(v)) = self.arrays.get_mut(name) {
+            for e in elems {
+                v.push(Some(e));
+            }
+        }
+    }
+
+    /// Assign `value` to a subscript. For an associative array `key` is the literal key; for an
+    /// indexed array `key` is parsed as an integer index (sparse — gaps become `None`).
+    pub fn array_set(&mut self, name: &str, key: &str, value: String) {
+        match self.arrays.get_mut(name) {
+            Some(ArrayVal::Assoc(m)) => {
+                m.insert(key.to_string(), value);
+            }
+            _ => {
+                self.ensure_indexed(name);
+                if let Some(ArrayVal::Indexed(v)) = self.arrays.get_mut(name) {
+                    let idx = key.trim().parse::<usize>().unwrap_or(0);
+                    if idx >= v.len() {
+                        v.resize(idx + 1, None);
+                    }
+                    v[idx] = Some(value);
+                }
+            }
+        }
+    }
+
+    /// Look up one subscript value.
+    pub fn array_get(&self, name: &str, key: &str) -> Option<String> {
+        match self.arrays.get(name) {
+            Some(ArrayVal::Assoc(m)) => m.get(key).cloned(),
+            Some(ArrayVal::Indexed(v)) => {
+                let idx = key.trim().parse::<usize>().ok()?;
+                v.get(idx).and_then(|o| o.clone())
+            }
+            None => None,
+        }
+    }
+
+    /// All set values in order (`${arr[@]}` / `${arr[*]}`).
+    pub fn array_all(&self, name: &str) -> Vec<String> {
+        match self.arrays.get(name) {
+            Some(ArrayVal::Assoc(m)) => m.values().cloned().collect(),
+            Some(ArrayVal::Indexed(v)) => v.iter().filter_map(|o| o.clone()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Keys/indices of set elements (`${!arr[@]}`).
+    pub fn array_keys(&self, name: &str) -> Vec<String> {
+        match self.arrays.get(name) {
+            Some(ArrayVal::Assoc(m)) => m.keys().cloned().collect(),
+            Some(ArrayVal::Indexed(v)) => v
+                .iter()
+                .enumerate()
+                .filter_map(|(i, o)| o.as_ref().map(|_| i.to_string()))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Count of set elements (`${#arr[@]}`).
+    pub fn array_len(&self, name: &str) -> usize {
+        match self.arrays.get(name) {
+            Some(ArrayVal::Assoc(m)) => m.len(),
+            Some(ArrayVal::Indexed(v)) => v.iter().filter(|o| o.is_some()).count(),
+            None => 0,
+        }
+    }
+
+    /// Unset one subscript (an element); returns true if the name remained an array.
+    pub fn array_unset_elem(&mut self, name: &str, key: &str) {
+        match self.arrays.get_mut(name) {
+            Some(ArrayVal::Assoc(m)) => {
+                m.remove(key);
+            }
+            Some(ArrayVal::Indexed(v)) => {
+                if let Ok(idx) = key.trim().parse::<usize>() {
+                    if idx < v.len() {
+                        v[idx] = None;
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Environment map visible to a child process (e.g. the python engine).
+    pub fn child_env(&self) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        for k in &self.exported {
+            if let Some(v) = self.vars.get(k) {
+                env.insert(k.clone(), v.clone());
+            }
+        }
+        env.insert("PWD".to_string(), self.cwd.clone());
+        env
+    }
+
+    pub fn new_job(&mut self, cmd: String) -> u32 {
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        self.jobs.push(Job { id, cmd, done: false, status: 0 });
+        id
+    }
+
+    pub fn note_unsupported(&mut self, what: &str) {
+        self.unsupported.push(what.to_string());
+    }
+}
+
+impl Default for Interp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
