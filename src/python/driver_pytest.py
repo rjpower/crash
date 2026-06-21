@@ -8,6 +8,11 @@ try:
     _fail = 0
     _ran = 0
     _tmpc = [0]
+    # Non-function-scoped fixtures (module/session/package/class) are instantiated once and
+    # cached; their teardown runs only after every test, mirroring pytest. Single test file ==
+    # single module, so we treat all non-function scopes as run-wide.
+    _scope_cache = {}
+    _session_fins = []
     def _params(_f):
         try:
             c = _f.__code__
@@ -58,6 +63,9 @@ try:
             return None
         _fn = _g.get(_name)
         if _fn is not None and getattr(_fn, '_pytest_fixture', False):
+            _scope = getattr(_fn, '_pytest_scope', 'function')
+            if _scope != 'function' and _name in _scope_cache:
+                return _scope_cache[_name]
             _kw = {}
             for _an in _params(_fn):
                 if _an in ('self', 'request'):
@@ -67,8 +75,11 @@ try:
                 _kw[_an] = _resolve(_an, _fins, _seen | {_name})
             _v = _fn(**_kw)
             if isinstance(_v, _types.GeneratorType):
-                _fins.append(_v)
-                return next(_v)
+                _gen = _v
+                _v = next(_gen)
+                (_session_fins if _scope != 'function' else _fins).append(_gen)
+            if _scope != 'function':
+                _scope_cache[_name] = _v
             return _v
         return _builtin_fixture(_name)
     def _call_with_fixtures(_fn):
@@ -98,16 +109,34 @@ try:
             import traceback as _tb
             _sys.stderr.write('FAILED ' + _label + ': ' + repr(_e) + '\n')
             _tb.print_exc()
-    for _n in sorted([k for k in list(_g.keys()) if k.startswith('test_')]):
-        _fn = _g[_n]
-        if callable(_fn):
-            _run_one(_fn, _n)
-    for _cn in sorted([k for k in list(_g.keys()) if k.startswith('Test')]):
+    def _lineno(_fn):
+        try:
+            return _fn.__code__.co_firstlineno
+        except Exception:
+            return 0
+    # pytest collects in source-definition order, not alphabetical — some suites rely on an
+    # earlier test producing state (output files, etc.) a later one reads.
+    _tests = [k for k in list(_g.keys()) if k.startswith('test_') and callable(_g[k])]
+    _tests.sort(key=lambda _k: _lineno(_g[_k]))
+    for _n in _tests:
+        _run_one(_g[_n], _n)
+    _classes = [k for k in list(_g.keys()) if k.startswith('Test') and isinstance(_g[k], type)]
+    _classes.sort(key=lambda _k: _lineno(_g[_k]))
+    for _cn in _classes:
         _cls = _g[_cn]
-        if isinstance(_cls, type):
-            _inst = _cls()
-            for _m in sorted([x for x in dir(_cls) if x.startswith('test_')]):
-                _run_one(getattr(_inst, _m), _cn + '.' + _m)
+        _inst = _cls()
+        _methods = [x for x in dir(_cls) if x.startswith('test_')]
+        _methods.sort(key=lambda _x: _lineno(getattr(_cls, _x, None)))
+        for _m in _methods:
+            _run_one(getattr(_inst, _m), _cn + '.' + _m)
+    # tear down module/session-scoped fixtures once, after every test (reverse order).
+    for _gen in reversed(_session_fins):
+        try:
+            next(_gen)
+        except StopIteration:
+            pass
+        except Exception:
+            pass
     if _ran == 0:
         _fail = 1
         _sys.stderr.write('no tests ran\n')

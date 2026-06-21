@@ -2,6 +2,28 @@
 import sys, io, os, types, builtins, posixpath
 _VFS_FILES = __VFS_FILES
 
+# Subclassing float/int (numpy dtypes do this) trips DeprecationWarnings to stderr; silence the
+# lot so warning noise can't leak into a verifier's captured output or be mistaken for an error.
+try:
+    import warnings as _warnings
+    _warnings.simplefilter('ignore')
+except Exception:
+    pass
+
+# ---- out-of-distribution + sim-library telemetry (read back by the Rust harness for trust) ----
+# The embedded mini-libraries (numpy/pandas/...) call `_shellsim_ood(msg)` when they hit a code
+# path they do not faithfully implement; any event forces the run's trust verdict to `low`.
+# `_shellsim_simlib` records which reimplemented libraries were used (caps trust at `medium`).
+# Single leading underscore on purpose: a dunder name would be mangled inside class bodies.
+_SHELLSIM_OOD = []
+_SHELLSIM_SIMLIB = set()
+def _shellsim_ood(msg):
+    _SHELLSIM_OOD.append(str(msg))
+def _shellsim_simlib(name):
+    _SHELLSIM_SIMLIB.add(str(name))
+builtins._shellsim_ood = _shellsim_ood
+builtins._shellsim_simlib = _shellsim_simlib
+
 _VFS_CWD = __VFS_CWD_INIT
 _VFS_DIRS = set(__VFS_DIRS_INIT)
 _VFS_DIRS.add('/')
@@ -257,6 +279,109 @@ def _os_stat(p):
         r = _stat_result(0); r.st_mode = 0o040755; return r
     raise FileNotFoundError(2, 'No such file: ' + p)
 os.stat = _os_stat
+os.lstat = _os_stat
+
+# ---- low-level fd I/O routed to the VFS (closes the os.open/os.read host-file leak) ----
+# RustPython ships os.open/os.read/io.FileIO implemented against the REAL filesystem, bypassing
+# the high-level open() shim. Re-implement them over a small VFS-backed fd table so low-level
+# code stays in the sandbox. The kernel seccomp filter already blocks net/exec; this closes the
+# remaining host-file *read* path.
+_VFS_FDS = {}
+_VFS_FD_NEXT = [10]
+def _os_open(path, flags, mode=0o777, **kw):
+    p = _vfs_norm(path)
+    wr = bool(flags & (os.O_WRONLY | os.O_RDWR))
+    creat = bool(flags & os.O_CREAT)
+    trunc = bool(flags & os.O_TRUNC)
+    append = bool(flags & getattr(os, 'O_APPEND', 0))
+    if p not in _VFS_FILES and not creat:
+        raise FileNotFoundError(2, 'No such file or directory: ' + p)
+    m = 'rb'
+    if append:
+        m = 'ab'
+    elif wr and trunc:
+        m = 'wb'
+    elif wr:
+        m = 'rb+' if p in _VFS_FILES else 'wb'
+    f = _VFile(p, m if 'b' in m else m + 'b')
+    fd = _VFS_FD_NEXT[0]; _VFS_FD_NEXT[0] += 1
+    _VFS_FDS[fd] = f
+    return fd
+def _os_read(fd, n):
+    f = _VFS_FDS.get(fd)
+    if f is None:
+        raise OSError(9, 'Bad file descriptor')
+    return f.read(n)
+def _os_write(fd, data):
+    f = _VFS_FDS.get(fd)
+    if f is None:
+        raise OSError(9, 'Bad file descriptor')
+    return f.write(data if isinstance(data, (bytes, bytearray)) else bytes(data))
+def _os_close(fd):
+    f = _VFS_FDS.pop(fd, None)
+    if f is not None:
+        f.close()
+def _os_lseek(fd, pos, how=0):
+    f = _VFS_FDS.get(fd)
+    if f is None:
+        raise OSError(9, 'Bad file descriptor')
+    return f.seek(pos, how)
+def _os_fdopen(fd, mode='r', *a, **k):
+    f = _VFS_FDS.get(fd)
+    if f is None:
+        raise OSError(9, 'Bad file descriptor')
+    return f
+os.open = _os_open
+os.read = _os_read
+os.write = _os_write
+os.close = _os_close
+os.lseek = _os_lseek
+os.fdopen = _os_fdopen
+
+def _os_scandir(p='.'):
+    p = _vfs_norm(p)
+    pref = p.rstrip('/') + '/'
+    seen = []
+    for n in _vfs_listdir(p):
+        full = pref + n
+        de = types.SimpleNamespace(name=n, path=full)
+        de.is_file = (lambda f: (lambda follow_symlinks=True: _vfs_isfile(f)))(full)
+        de.is_dir = (lambda f: (lambda follow_symlinks=True: _vfs_isdir(f)))(full)
+        de.is_symlink = lambda: False
+        de.stat = (lambda f: (lambda follow_symlinks=True: _os_stat(f)))(full)
+        de.inode = lambda: 0
+        seen.append(de)
+    class _SD(list):
+        def __enter__(self_): return iter(self_)
+        def __exit__(self_, *a): return False
+    return _SD(seen)
+os.scandir = _os_scandir
+
+# io.FileIO bypasses the open() shim too — route it (and BytesIO/StringIO stay native).
+def _io_fileio(name, mode='r', closefd=True, opener=None):
+    return _VFile(_vfs_norm(str(name)), mode if 'b' in mode else mode + 'b')
+io.FileIO = _io_fileio
+
+# ---- socket: hard-stubbed (the kernel seccomp filter also blocks the syscall) ----
+# Present a module so `import socket` succeeds, but any attempt to actually create/connect a
+# socket raises a clear, deterministic error instead of a raw seccomp EPERM.
+_socket = types.ModuleType('socket')
+_socket.AF_INET = 2; _socket.AF_INET6 = 10; _socket.AF_UNIX = 1
+_socket.SOCK_STREAM = 1; _socket.SOCK_DGRAM = 2
+_socket.SOL_SOCKET = 1; _socket.SO_REUSEADDR = 2
+_socket.gethostname = lambda: 'sandbox'
+_socket.getfqdn = lambda *a: 'sandbox'
+_socket.gethostbyname = lambda *a: '127.0.0.1'
+class _SocketError(OSError):
+    pass
+_socket.error = _SocketError
+_socket.timeout = _SocketError
+_socket.gaierror = _SocketError
+def _socket_blocked(*a, **k):
+    raise _SocketError('network access is disabled in the shellsim sandbox')
+_socket.socket = _socket_blocked
+_socket.create_connection = _socket_blocked
+sys.modules['socket'] = _socket
 
 # ---- shutil basics ----
 try:
@@ -555,9 +680,11 @@ class _Mark:
         return deco
 _pytest.mark = _Mark()
 def _pt_fixture(*a, **k):
+    _scope = k.get('scope', 'function')
     def _reg(f):
         try:
             f._pytest_fixture = True
+            f._pytest_scope = _scope
         except Exception:
             pass
         return f
@@ -768,6 +895,15 @@ _subprocess.getstatusoutput = _sp_getstatusoutput
 _subprocess.Popen = _Popen
 sys.modules['subprocess'] = _subprocess
 
+# os.system: route through the same in-process shim (python/.py re-enter the VM; anything else
+# is "command not found" -> 127<<8). Never execs a real program — the seccomp filter forbids it.
+def _os_system(cmd):
+    rc, o, e = _sp_exec(cmd, shell=True)
+    sys.stdout.write(o); sys.stderr.write(e)
+    return (rc & 0xff) << 8
+os.system = _os_system
+os.popen = lambda cmd, *a, **k: io.StringIO(_sp_exec(cmd, shell=True)[1])
+
 # ---- importlib shim: load source from the VFS, not the host filesystem ----
 # Verifiers commonly do:
 #   spec = importlib.util.spec_from_file_location("mod", "/app/solution.py")
@@ -932,7 +1068,73 @@ def _preload_modules():
             exec(compile(srctext, path, 'exec'), sys.modules[name].__dict__)
         except Exception:
             pass
-_preload_modules()
+# NOTE: we no longer eagerly preload top-level VFS modules. _VfsPathFinder (installed below,
+# after the sim-lib finder) resolves them lazily *with* correct exception propagation — eager
+# preload ran before the sim-libs were importable and silently cached partial modules (e.g. a
+# `splitter` whose `import numpy` failed, leaving it with no `main`).
+
+# ---- embedded mini-library importer (numpy/pandas/scipy/sklearn/yaml) ----
+# The Rust host injects __SIM_LIBS = {top_name: source} and __INSTALLED = [pkgs]. A package is
+# importable only if it was "installed" (pip/uv recorded it) — mirroring a real venv. Each lib's
+# source self-registers its submodules in sys.modules, so `import numpy.linalg` etc. resolve.
+import importlib as _il
+import importlib.machinery as _ilm
+_SIM_LIBS = dict(globals().get('__SIM_LIBS', {}))
+_INSTALLED = set(globals().get('__INSTALLED', []))
+
+class _SimLoader:
+    def __init__(self, name, src):
+        self.name = name
+        self.src = src
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        _shellsim_simlib(self.name)
+        module.__dict__.setdefault('__name__', self.name)
+        module.__dict__.setdefault('__package__', self.name)
+        exec(compile(self.src, '<sim:%s>' % self.name, 'exec'), module.__dict__)
+
+class _SimFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        top = fullname.split('.')[0]
+        # Only the top-level package is served here; the lib registers its own submodules, which
+        # Python then finds in sys.modules before consulting this finder again.
+        if fullname == top and top in _SIM_LIBS and top in _INSTALLED:
+            spec = _ilm.ModuleSpec(fullname, _SimLoader(fullname, _SIM_LIBS[top]))
+            spec.submodule_search_locations = []
+            return spec
+        return None
+
+sys.meta_path.insert(0, _SimFinder())
+
+# ---- VFS path finder: resolve `import pkg` / `from pkg.sub import x` for source that lives in
+# the VFS under a sys.path entry (e.g. a task's `/app/src/` package). Statement imports go
+# through sys.meta_path, which otherwise only knows the host filesystem; this makes the in-memory
+# tree importable like a real one. Stdlib names fall through (no `<dir>/json.py` exists -> None).
+class _VfsPathFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        rel = fullname.rpartition('.')[2]
+        dirs = list(path) if path is not None else list(sys.path)
+        for d in dirs:
+            if not isinstance(d, str):
+                continue
+            base = (_vfs_norm(d) if d else _VFS_CWD).rstrip('/')
+            init = base + '/' + rel + '/__init__.py'
+            modf = base + '/' + rel + '.py'
+            target_path = init if init in _VFS_FILES else (modf if modf in _VFS_FILES else None)
+            if target_path is None:
+                continue
+            is_pkg = target_path.endswith('/__init__.py')
+            # Build a *real* ModuleSpec (it carries the private attrs the import machinery
+            # touches, e.g. _uninitialized_submodules) backed by our VFS source loader.
+            spec = _ilm.ModuleSpec(fullname, _VfsLoader(fullname, target_path),
+                                   origin=target_path, is_package=is_pkg)
+            if is_pkg:
+                spec.submodule_search_locations = [posixpath.dirname(target_path)]
+            return spec
+        return None
+
+sys.meta_path.insert(1, _VfsPathFinder())
 
 # ---- redirect stdout/stderr for capture ----
 sys.stdout = io.StringIO()

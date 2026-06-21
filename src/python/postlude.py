@@ -17,3 +17,10 @@ for _p, _d in _VFS_FILES.items():
     except Exception:
         pass
 __VFS_DUMP_JSON = _json.dumps(_dump)
+# OOD events + reimplemented libraries used, read back by the harness to set the trust verdict.
+try:
+    __OOD_S = '\n'.join(_SHELLSIM_OOD)
+    __SIMLIB_S = '\n'.join(sorted(_SHELLSIM_SIMLIB))
+except Exception:
+    __OOD_S = ''
+    __SIMLIB_S = ''

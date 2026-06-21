@@ -29,6 +29,13 @@ crc32fast = "1"
 rustpython-vm = { version = "0.4", features = ["freeze-stdlib"], optional = true }
 rustpython = { version = "0.4", features = ["stdlib", "freeze-stdlib"], optional = true }
 
+# Process-level syscall sandbox (Linux only): a startup seccomp filter that denies
+# network/exec/fork so no Python-level trick can reach the real OS for those. shellsim
+# itself never opens sockets, execs, or forks, so this is safe for its own file I/O.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+libc = "0.2"
+
 [features]
 default = []
 python = ["dep:rustpython-vm", "dep:rustpython"]

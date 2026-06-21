@@ -71,6 +71,18 @@ pub struct Interp {
     pub trust_noop: std::collections::BTreeSet<String>,
     /// command names that ran as `Trust::Partial` (subset impl — e.g. jq/sed) during this run
     pub trust_partial: std::collections::BTreeSet<String>,
+    /// Installed Python packages (by *import* name, e.g. `numpy`, `sklearn`). Populated by the
+    /// `pip`/`uv`/`conda` shims as the Dockerfile/solve script "installs" them. Gates whether the
+    /// embedded mini-libraries are importable, mirroring a real venv (see [[shell-sim-design]]).
+    pub packages: std::collections::BTreeSet<String>,
+    /// Out-of-distribution events raised by the embedded mini-libraries: a code path that our
+    /// numpy/pandas/scipy/sklearn shim does not faithfully implement was hit. Accumulated across
+    /// every Python invocation in a run; any entry forces the trust verdict to `low`.
+    pub py_ood: Vec<String>,
+    /// Embedded mini-libraries that were actually imported during a run (e.g. `numpy`/`pandas`).
+    /// Using a reimplemented scientific library caps trust at `medium` (reward is plausible but
+    /// not guaranteed byte-identical to the real library — the eval harness is the backstop).
+    pub py_simlib: std::collections::BTreeSet<String>,
 }
 
 impl Interp {
@@ -118,6 +130,30 @@ impl Interp {
             unsupported: Vec::new(),
             trust_noop: std::collections::BTreeSet::new(),
             trust_partial: std::collections::BTreeSet::new(),
+            packages: std::collections::BTreeSet::new(),
+            py_ood: Vec::new(),
+            py_simlib: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Mark a Python package (by *import* name) as installed, pulling in the dependency closure
+    /// our mini-libraries assume (pandas/scipy/sklearn all need numpy; sklearn also needs scipy).
+    /// This mirrors `pip` resolving transitive deps so a task that only `pip install pandas` can
+    /// still `import numpy` indirectly.
+    pub fn install_package(&mut self, import_name: &str) {
+        let name = import_name.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.packages.insert(name.to_string());
+        let deps: &[&str] = match name {
+            "pandas" => &["numpy"],
+            "scipy" => &["numpy"],
+            "sklearn" => &["numpy", "scipy"],
+            _ => &[],
+        };
+        for d in deps {
+            self.packages.insert((*d).to_string());
         }
     }
 
