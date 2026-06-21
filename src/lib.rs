@@ -21,6 +21,7 @@ pub mod jqcmd;
 pub mod net;
 pub mod netcmd;
 pub mod python;
+pub mod sandbox;
 pub mod shell;
 pub mod vfs;
 

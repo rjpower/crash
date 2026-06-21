@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::interp::Interp;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TaskResult {
     pub task: String,
     pub reward: f64,
@@ -139,9 +139,30 @@ pub fn run_task(task_dir: &Path) -> TaskResult {
         for m in &missing {
             trust_gaps.push(format!("import:{m}"));
         }
-        trust_gaps.sort();
-        trust_gaps.dedup();
     }
+    // A reimplemented scientific library was used: the reward is plausible but not guaranteed
+    // byte-identical to the real library, so cap trust at `medium` (the eval/ ground-truth
+    // harness is the backstop for logic divergence). Does not downgrade an already-`low`.
+    if !interp.py_simlib.is_empty() {
+        if trust == "high" {
+            trust = "medium".to_string();
+        }
+        for m in &interp.py_simlib {
+            trust_gaps.push(format!("simlib:{m}"));
+        }
+    }
+    // An OOD event means a mini-library hit a path it does not faithfully implement — the
+    // reward is unreliable, full stop.
+    if !interp.py_ood.is_empty() {
+        trust = "low".to_string();
+        let mut ood = dedup(interp.py_ood.clone());
+        ood.truncate(8);
+        for m in ood {
+            trust_gaps.push(format!("ood:{m}"));
+        }
+    }
+    trust_gaps.sort();
+    trust_gaps.dedup();
     let (reward, passed, status, note) = match reward {
         Some(r) => {
             let passed = r >= 0.999;

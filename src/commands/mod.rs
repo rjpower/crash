@@ -18,7 +18,7 @@ mod builtins;
 mod fs;
 mod hashing;
 mod net;
-mod pkg;
+pub(crate) mod pkg;
 mod proc;
 mod text;
 pub mod util;

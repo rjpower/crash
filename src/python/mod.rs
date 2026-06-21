@@ -61,6 +61,23 @@ pub fn run_python(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out
     if module.as_deref() == Some("pytest") {
         return run_pytest(interp, &prog_args, out, err);
     }
+    // `-m pip install …` → update package state (mirrors a real venv); other pip subcommands
+    // are benign successes.
+    if module.as_deref() == Some("pip") {
+        if prog_args.first().map(|s| s.as_str()) == Some("install") {
+            crate::commands::pkg::register_install_args(interp, &prog_args);
+        }
+        return 0;
+    }
+    // `-m venv <dir>` → leave a plausible venv marker.
+    if module.as_deref() == Some("venv") {
+        if let Some(dir) = prog_args.iter().find(|a| !a.starts_with('-')) {
+            let base = crate::vfs::resolve_against(&interp.cwd, dir);
+            let _ = interp.vfs.mkdir_all("/", &format!("{base}/bin"));
+            interp.vfs.put_file(&format!("{base}/bin/python"), b"#!shellsim-venv\n".to_vec(), 0o755);
+        }
+        return 0;
+    }
     if let Some(m) = module {
         interp.note_unsupported(&format!("python -m {m}"));
         ewln(err, &format!("python: module {m} not available in sandbox"));
@@ -209,6 +226,8 @@ mod imp {
         let env = interp.child_env();
         let cwd = interp.cwd.clone();
         let pypath = build_pypath(interp, file, &env);
+        // Installed-package set (gates which mini-libraries are importable).
+        let installed: Vec<String> = interp.packages.iter().cloned().collect();
 
         // A brand-new interpreter per invocation. This guarantees perfect isolation between
         // programs (no leftover user globals, `sys.modules`, `builtins`/stdlib mutations, or
@@ -220,6 +239,8 @@ mod imp {
         let mut exit_code = 0i32;
         let mut stdout_s = String::new();
         let mut stderr_s = String::new();
+        let mut ood_s = String::new();
+        let mut simlib_s = String::new();
         let mut files_after: HashMap<String, Vec<u8>> = files_before.clone();
         let mut dirs_after: Vec<String> = dirs_before.iter().cloned().collect();
 
@@ -256,6 +277,16 @@ mod imp {
 
             let _ = g.set_item("__USER_SRC", vm.ctx.new_str(src.to_owned()).into(), vm);
             let _ = g.set_item("__USER_FILE", vm.ctx.new_str(file.to_owned()).into(), vm);
+
+            // Embedded mini-library sources + the installed-package gate.
+            let sim_dict = vm.ctx.new_dict();
+            for (name, source) in SIM_LIBS {
+                let _ = sim_dict.set_item(*name, vm.ctx.new_str((*source).to_owned()).into(), vm);
+            }
+            let _ = g.set_item("__SIM_LIBS", sim_dict.into(), vm);
+            let inst: Vec<vm::PyObjectRef> =
+                installed.iter().map(|p| vm.ctx.new_str(p.clone()).into()).collect();
+            let _ = g.set_item("__INSTALLED", vm.ctx.new_list(inst).into(), vm);
 
             // ---- run prelude, then driver ----
             let program = format!("{PRELUDE}\n{driver}\n{POSTLUDE}");
@@ -296,6 +327,12 @@ mod imp {
             if let Some(s) = getstr("__VFS_DIRS_S") {
                 dirs_after = s.lines().map(|l| l.to_string()).filter(|l| !l.is_empty()).collect();
             }
+            if let Some(s) = getstr("__OOD_S") {
+                ood_s = s;
+            }
+            if let Some(s) = getstr("__SIMLIB_S") {
+                simlib_s = s;
+            }
             if let Some(json) = getstr("__VFS_DUMP_JSON") {
                 if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&json) {
                     let mut out = HashMap::new();
@@ -310,6 +347,14 @@ mod imp {
                 }
             }
         });
+
+        // ---- fold in OOD / sim-library telemetry for the trust verdict ----
+        for line in ood_s.lines().filter(|l| !l.is_empty()) {
+            interp.py_ood.push(line.to_string());
+        }
+        for line in simlib_s.lines().filter(|l| !l.is_empty()) {
+            interp.py_simlib.insert(line.to_string());
+        }
 
         // ---- reconcile changes back into the VFS ----
         reconcile(interp, &files_before, &files_after, &dirs_before, &dirs_after);
@@ -398,6 +443,32 @@ const PRELUDE: &str = include_str!("prelude.py");
 #[cfg(feature = "python")]
 const POSTLUDE: &str = include_str!("postlude.py");
 
+// Embedded "as-dumb-as-possible" reimplementations of the scientific-Python stack, served to
+// sandbox code by the prelude's meta-path finder when the matching package is installed. They
+// cover the basic usage surface and call `_shellsim_ood(...)` (→ trust `low`) on any path they
+// do not faithfully implement, so we never silently return a wrong answer.
+#[cfg(feature = "python")]
+const SIM_NUMPY: &str = include_str!("sim_numpy.py");
+#[cfg(feature = "python")]
+const SIM_PANDAS: &str = include_str!("sim_pandas.py");
+#[cfg(feature = "python")]
+const SIM_SCIPY: &str = include_str!("sim_scipy.py");
+#[cfg(feature = "python")]
+const SIM_SKLEARN: &str = include_str!("sim_sklearn.py");
+#[cfg(feature = "python")]
+const SIM_YAML: &str = include_str!("sim_yaml.py");
+
+/// Top-level import name → embedded source. The finder serves only these names (gated on the
+/// installed-package set); each source self-registers its own submodules in `sys.modules`.
+#[cfg(feature = "python")]
+const SIM_LIBS: &[(&str, &str)] = &[
+    ("numpy", SIM_NUMPY),
+    ("pandas", SIM_PANDAS),
+    ("scipy", SIM_SCIPY),
+    ("sklearn", SIM_SKLEARN),
+    ("yaml", SIM_YAML),
+];
+
 #[cfg(test)]
 mod py_syntax_tests {
     //! Syntax-check the embedded Python sources (prelude / postlude / drivers) with the
@@ -422,7 +493,10 @@ mod py_syntax_tests {
             return;
         }
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/python");
-        for name in ["prelude.py", "postlude.py", "driver_exec.py", "driver_pytest.py"] {
+        for name in [
+            "prelude.py", "postlude.py", "driver_exec.py", "driver_pytest.py",
+            "sim_numpy.py", "sim_pandas.py", "sim_scipy.py", "sim_sklearn.py", "sim_yaml.py",
+        ] {
             let file = dir.join(name);
             assert!(file.exists(), "missing embedded Python file: {}", file.display());
             let out = Command::new("python3")
@@ -438,5 +512,104 @@ mod py_syntax_tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "python"))]
+mod sim_integration_tests {
+    //! End-to-end checks that exercise the package-state gating, the `uv`/`pip` plumbing, and the
+    //! embedded numpy/pandas semantics through a real shell+Python run. These guard the specific
+    //! bugs found during validation (Series→ndarray coercion, clip with array bounds, 0-size
+    //! broadcast, multi-axis reduction, vector·matrix dot).
+
+    use crate::interp::Interp;
+
+    /// Run a shell snippet through a fresh interpreter, returning (stdout, stderr).
+    fn run(src: &str) -> (String, String) {
+        let mut i = Interp::new();
+        let ast = crate::shell::parse(src);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        crate::exec::exec(&mut i, &ast, Vec::new(), &mut out, &mut err);
+        (
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    #[test]
+    fn numpy_importable_only_after_install() {
+        // not installed -> import fails
+        let (_o, e) = run(r#"python3 -c 'import numpy' "#);
+        assert!(e.contains("No module named 'numpy'"), "expected gating error, got: {e}");
+        // installed -> import + basic op works
+        let (o, _e) = run("pip install numpy\npython3 -c 'import numpy as np; print(int(np.array([1,2,3]).sum()))'");
+        assert_eq!(o.trim(), "6");
+    }
+
+    #[test]
+    fn uv_add_records_package_and_writes_pyproject() {
+        let (o, _e) = run(
+            "uv add pandas\n\
+             test -f pyproject.toml && echo HASPROJ\n\
+             python3 -c 'import pandas as pd; print(len(pd.DataFrame({\"a\":[1,2,3]})))'",
+        );
+        assert!(o.contains("HASPROJ"), "pyproject.toml not written: {o}");
+        assert!(o.contains("3"), "pandas not importable after uv add: {o}");
+    }
+
+    #[test]
+    fn numpy_clip_with_array_bounds() {
+        // regression: np.clip(x, lo, hi_array) must broadcast the per-element upper bound.
+        let (o, _e) = run(
+            "pip install numpy\n\
+             python3 -c 'import numpy as np; \
+             print(np.clip(np.array([5,5,5]), 0, np.array([1,9,3])).tolist())'",
+        );
+        assert_eq!(o.trim(), "[1, 5, 3]");
+    }
+
+    #[test]
+    fn numpy_zero_size_broadcast_and_multiaxis_reduce() {
+        let (o, _e) = run(
+            "pip install numpy\n\
+             python3 -c 'import numpy as np; \
+             x=np.ones((2,3,4)); print(np.max(x, axis=(0,1)).shape); \
+             print((1.0 + np.array([])).shape)'",
+        );
+        let lines: Vec<&str> = o.trim().lines().collect();
+        assert_eq!(lines[0], "(4,)", "multi-axis reduce shape wrong: {o}");
+        assert_eq!(lines[1], "(0,)", "0-size broadcast shape wrong: {o}");
+    }
+
+    #[test]
+    fn numpy_vector_matrix_dot() {
+        let (o, _e) = run(
+            "pip install numpy\n\
+             python3 -c 'import numpy as np; \
+             a=np.array([1.0,2.0]); M=np.array([[1.0,0.0,2.0],[0.0,1.0,3.0]]); \
+             print((a @ M).tolist())'",
+        );
+        assert_eq!(o.trim(), "[1.0, 2.0, 8.0]");
+    }
+
+    #[test]
+    fn pandas_series_times_ndarray_is_elementwise() {
+        // regression: Series * ndarray must align element-wise, not treat the array as a scalar.
+        let (o, _e) = run(
+            "pip install numpy pandas\n\
+             python3 -c 'import pandas as pd, numpy as np; \
+             s=pd.Series([1,0,1,0,1]); w=np.array([10.0,5.0,1.0,2.0,3.0]); \
+             print(float((s*w).sum()))'",
+        );
+        assert_eq!(o.trim(), "14.0");
+    }
+
+    #[test]
+    fn uninstalled_import_is_low_trust_not_silent() {
+        // A genuinely missing third-party module surfaces as an error (the harness reads this as
+        // an OOD/low-trust signal), never a silent wrong answer.
+        let (_o, e) = run(r#"python3 -c 'import torch' "#);
+        assert!(e.contains("No module named 'torch'"), "expected missing-module error: {e}");
     }
 }

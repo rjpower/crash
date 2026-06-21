@@ -141,10 +141,36 @@ fn cmd_sh(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     code
 }
 
-/// `uv` / `uvx` / `uv run` / `uv tool run`: we don't install anything, but we DO route an
-/// embedded `pytest`/`python` invocation to our engines so verifiers that launch pytest via
-/// uv still run. Everything else (pip install, venv, …) is a successful no-op.
+/// `uv` / `uvx` / `uv run` / `uv tool run`: package-management subcommands update the simulated
+/// venv / installed-package state; `run`/`tool run`/`uvx` route an embedded `pytest`/`python`
+/// to our engines so verifiers launched via uv still run.
 fn cmd_uv(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+    let has = |s: &str| args.iter().any(|a| a == s);
+    // ---- package management (takes priority so `uv pip install pytest` installs, not runs) ----
+    if has("add") {
+        crate::commands::pkg::register_install_args(interp, args);
+        update_pyproject(interp, &install_specs_after(args, "add"));
+        ensure_venv(interp);
+        return 0;
+    }
+    if has("remove") {
+        return 0;
+    }
+    if has("sync") || has("lock") {
+        uv_sync(interp);
+        ensure_venv(interp);
+        return 0;
+    }
+    if has("pip") && has("install") {
+        crate::commands::pkg::register_install_args(interp, args);
+        ensure_venv(interp);
+        return 0;
+    }
+    if has("venv") || has("init") {
+        ensure_venv(interp);
+        return 0;
+    }
+    // ---- run / tool run / uvx: route the embedded interpreter ----
     if let Some(pos) = args.iter().position(|a| a == "pytest" || a.ends_with("/pytest")) {
         return crate::python::run_pytest(interp, &args[pos + 1..], io.out, io.err);
     }
@@ -154,9 +180,130 @@ fn cmd_uv(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
         let stdin = std::mem::take(&mut io.stdin);
         return crate::python::run_python(interp, &argv, stdin, io.out, io.err);
     }
-    // record the unrouted uv invocation as unsupported (preserves legacy behavior)
     interp.note_unsupported(&args[0]);
     0
+}
+
+/// Collect the raw package specs following a `uv add` / `uv pip install` keyword (for pyproject).
+fn install_specs_after(args: &[String], kw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == kw {
+            seen = true;
+            i += 1;
+            continue;
+        }
+        if !seen {
+            i += 1;
+            continue;
+        }
+        if a == "--requirement" || a == "-r" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    out
+}
+
+/// Create the marker files a real `uv`/`venv` would leave behind, so tasks that *inspect* the
+/// environment (a `.venv`, a `uv.lock`) see plausible state.
+fn ensure_venv(interp: &mut Interp) {
+    let cwd = interp.cwd.clone();
+    for d in [".venv", ".venv/bin"] {
+        let p = crate::vfs::resolve_against(&cwd, d);
+        let _ = interp.vfs.mkdir_all("/", &p);
+    }
+    let py = crate::vfs::resolve_against(&cwd, ".venv/bin/python");
+    if !interp.vfs.is_file("/", &py) {
+        interp.vfs.put_file(&py, b"#!shellsim-venv\n".to_vec(), 0o755);
+    }
+    let lock = crate::vfs::resolve_against(&cwd, "uv.lock");
+    if !interp.vfs.is_file("/", &lock) {
+        interp.vfs.put_file(&lock, b"# shellsim uv.lock\n".to_vec(), 0o644);
+    }
+}
+
+/// `uv sync` / `uv lock`: register every dependency declared in `pyproject.toml`.
+fn uv_sync(interp: &mut Interp) {
+    let cwd = interp.cwd.clone();
+    let path = crate::vfs::resolve_against(&cwd, "pyproject.toml");
+    if let Ok(content) = interp.vfs.read_string("/", &path) {
+        // pull each "name>=ver" / "name==ver" string out of the dependencies arrays
+        for spec in extract_dep_specs(&content) {
+            if let Some(name) = crate::commands::pkg::package_name_of(&spec) {
+                interp.install_package(&name);
+            }
+        }
+    }
+    // a requirements.txt next to it, if present
+    let req = crate::vfs::resolve_against(&cwd, "requirements.txt");
+    if interp.vfs.is_file("/", &req) {
+        crate::commands::pkg::register_requirements_file(interp, &req);
+    }
+}
+
+/// Add specs to `pyproject.toml`'s `[project] dependencies` (creating the file/section if absent).
+fn update_pyproject(interp: &mut Interp, specs: &[String]) {
+    if specs.is_empty() {
+        return;
+    }
+    let cwd = interp.cwd.clone();
+    let path = crate::vfs::resolve_against(&cwd, "pyproject.toml");
+    let mut content = interp.vfs.read_string("/", &path).unwrap_or_default();
+    if !content.contains("[project]") {
+        content.push_str("[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = []\n");
+    }
+    if !content.contains("dependencies") {
+        content.push_str("dependencies = []\n");
+    }
+    for spec in specs {
+        if content.contains(spec.as_str()) {
+            continue;
+        }
+        if let Some(idx) = content.find("dependencies = [") {
+            let at = idx + "dependencies = [".len();
+            content.insert_str(at, &format!("\n    \"{spec}\","));
+        }
+    }
+    interp.vfs.put_file(&path, content.into_bytes(), 0o644);
+}
+
+/// Extract `name[op ver]` dependency strings from a pyproject's dependencies arrays.
+fn extract_dep_specs(toml_src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_deps = false;
+    for line in toml_src.lines() {
+        let t = line.trim();
+        if t.starts_with("dependencies") && t.contains('[') {
+            in_deps = true;
+        }
+        if in_deps {
+            for part in t.split(|c| c == '"' || c == '\'') {
+                let p = part.trim().trim_end_matches(',');
+                // a dependency spec starts with a letter (name); package_name_of strips any
+                // version operator. Skips the `dependencies = [` token and bare punctuation.
+                if !p.is_empty()
+                    && p.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+                    && p != "dependencies"
+                {
+                    out.push(p.to_string());
+                }
+            }
+            if t.contains(']') {
+                in_deps = false;
+            }
+        }
+    }
+    out
 }
 
 fn cmd_python3(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
