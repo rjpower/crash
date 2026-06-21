@@ -1,0 +1,40 @@
+[package]
+name = "shellsim"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic, in-memory bash-like shell simulator for agentic RL — bring-your-own-sandbox"
+license = "Apache-2.0"
+
+[[bin]]
+name = "shellsim"
+path = "src/main.rs"
+
+[lib]
+name = "shellsim"
+path = "src/lib.rs"
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+glob = "0.3"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+base64 = "0.22"
+crc32fast = "1"
+
+# Python engine (heavy build) is feature-gated so the core iterates fast.
+rustpython-vm = { version = "0.4", features = ["freeze-stdlib"], optional = true }
+rustpython = { version = "0.4", features = ["stdlib", "freeze-stdlib"], optional = true }
+
+[features]
+default = []
+python = ["dep:rustpython-vm", "dep:rustpython"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 2
