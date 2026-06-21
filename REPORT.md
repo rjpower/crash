@@ -62,7 +62,7 @@ src/net.rs       virtual network — curl/wget resolve a route table, no real eg
 src/shell.rs     lexer + recursive-descent parser (heredocs, pipes, control flow, funcs)
 src/expand.rs    word expansion: $VAR ${..} $(..) `..` $((..)) globbing, splitting
 src/exec.rs      executor: pipelines, redirects, if/for/while/case, errexit/pipefail
-src/commands.rs  ~110 builtins/coreutils dispatched in-process
+src/commands/    ~110 builtins/coreutils behind a registry (builtins/fs/text/…; see §8)
 src/hashes.rs    byte-exact sha1/256/512, md5, crc32, base64
 src/jqcmd.rs     a jq subset over serde_json
 src/python.rs    the Python engine (RustPython) + the VFS bridge  ← the hard part
@@ -118,14 +118,17 @@ scientific stack, at rewritten paths, and records the reward. Then we compare, p
 ### Headline result (72 real-oracle tasks)
 
 ```
-sandbox full passes (reward = 1.0):              7
+sandbox full passes (reward = 1.0):              9
 tasks both harnesses could score:               57
-  exact reward match  (FAITHFUL):               36   (63%)
-  of which reward > 0 (non-trivial):             7
-OUR_GAP   (sandbox < real, true gaps):          18
+  exact reward match  (FAITHFUL):               38   (66%)
+  of which reward > 0 (non-trivial):             9
+OUR_GAP   (sandbox < real, true gaps):          16
 SIM_HIGHER (ground-truth-harness artifacts):     3
 GT_UNAVAILABLE (offline gt couldn't score):     10
 ```
+
+(Up from 36/57 and 7 passes in the first cut, after a follow-up round added bash
+arrays, a VFS-backed `importlib`, and a per-rollout trust signal — see §8.)
 
 The faithful set includes **byte-exact fractional partial credit** from anti-cheat
 graders — not just pass/fail:
@@ -133,12 +136,16 @@ graders — not just pass/fail:
 | task | sandbox | real CPython |
 |---|---|---|
 | api-endpoint-permission-canonicalizer | 1.0 | 1.0 |
+| build-system-task-ordering | 1.0 | 1.0 |
 | log-summary | 1.0 | 1.0 |
 | malicious-package-forensics | 1.0 | 1.0 |
+| raft-log-repair-concurrent-access | 1.0 | 1.0 |
 | schedule-vacation | 1.0 | 1.0 |
 | security-breach-incident-response | **0.750** | 0.750 |
 | security-incident-log-analysis | **0.922** | 0.9219999999999999 |
 | tsl-test-case-generation | **0.8825** | 0.8825000000000001 |
+
+(All 9 read `trust=high` — see §8.)
 
 Reproducing `0.922` and `0.8825` to the last digit means the sandbox is running the real
 grader's real arithmetic on real outputs — the strongest possible evidence of fidelity.
@@ -176,15 +183,16 @@ Eight systemic fixes followed, each found by a real task and each lifting a whol
 
 ## 6. Where it works, and the boundary
 
-The 18 real coverage gaps are **mostly fundamental**, not bugs:
+The 16 remaining coverage gaps are **mostly fundamental**, not bugs:
 
 | blocker | tasks | verdict |
 |---|---|---|
 | numpy / pandas / sklearn | 5 | out of scope for a lightweight sim |
-| task-specific (intricate verifier/CLI fidelity) | 8 | fixable case-by-case |
-| `importlib.spec_from_file_location` loads from host FS | 2 | fixable (VFS importer hook) |
-| bash associative/indexed arrays | 2 | fixable (medium effort) |
+| task-specific (intricate verifier/CLI fidelity) | 7 | fixable case-by-case |
+| native compile / container / vim / real service | 3 | out of scope |
 | `flock` / real concurrency | 1 | out of scope |
+
+(The earlier "importlib loads from host FS" and "bash arrays" rows are now closed — see §8.)
 
 **A task is a good fit for shellsim when** its oracle and verifier stay within: bash +
 coreutils + text tools, Python standard library, file/JSON/CSV I/O, hashing, and
@@ -192,11 +200,9 @@ subprocess-ing its own CLI. **It is a poor fit when** it needs the scientific Py
 stack, a real listening server, native compilation (gcc/clang), real concurrency, or
 package installs whose contents the task actually executes.
 
-On this corpus that's roughly **a quarter of tasks today**, with a clear, mostly
-mechanical path (arrays, the VFS importer, a small numpy shim) to push higher. Crucially,
-the framework **knows when it's out of its depth**: unsupported commands are recorded, so
-a training pipeline can *gate* on "did this rollout stay inside the simulable envelope?"
-and fall back to a real sandbox only for the tasks that need one.
+On this corpus that's roughly **a quarter of tasks today**. Crucially, the framework
+**knows when it's out of its depth** (see the trust signal, §8), so a training pipeline
+can fall back to a real sandbox only for the tasks that need one.
 
 ## 7. Recommendation
 
@@ -204,21 +210,59 @@ This is a viable cost-reducer for agentic RL, used as a **filter, not a replacem
 
 - Run rollouts in `shellsim` first; it's deterministic, sub-millisecond per command, and
   has no real I/O, network, or blocking.
-- Use the unsupported-feature log to decide per-task (or per-rollout) whether the
-  simulated reward is trustworthy; route the rest to a real sandbox.
+- Use the per-rollout **trust signal** (§8) to decide whether the simulated reward is
+  usable; route `low`/`medium` to a real sandbox.
 - The ground-truth comparison harness should be kept in CI: it's how we know the sim
-  hasn't drifted, and it's how every faithfulness regression in this project was caught.
+  hasn't drifted, and it's how every faithfulness regression in this project was caught —
+  and it's the backstop for the trust signal's one blind spot (subtle logic divergence).
 
-The highest-leverage next steps, in order: bash arrays, a VFS-backed `importlib` loader,
-`@pytest.mark.parametrize`, and a minimal numpy/pandas shim — each converts a named,
-already-categorized slice of the OUR_GAP list into faithful coverage.
+## 8. Follow-up round — architecture, arrays, importlib, and a trust signal
+
+A second pass turned the prototype into something maintainable *and* safer to train on:
+
+**Maintainable structure.** The 2543-line `commands.rs` `match` became `src/commands/`
+(`builtins`, `fs`, `text`, `hashing`, `net`, `proc`, `pkg`) behind a registry —
+`HashMap<&str, CommandSpec{run, trust}>` with a uniform `fn(&mut Interp, &[String],
+&mut Io) -> i32` signature. New commands are one registration line; the "environment"
+(`Interp`: VFS + clock + net + vars) is the single context every command receives. The
+~700-line Python prelude moved out of a Rust string into real `src/python/*.py` files
+(`include_str!`) with a CPython `py_compile` test. (A warm/persistent interpreter was
+prototyped and dropped — with `freeze-stdlib` the init is already cheap, and a shared
+`builtins` couldn't guarantee cross-program isolation. Correctness over speed.)
+
+**Two coverage gaps closed.** Bash arrays (indexed + associative: `arr=(…)`,
+`${arr[@]}`, `${!m[@]}`, `${#a[@]}`, slices, `declare -A`) — 18/72 oracles use them.
+And `importlib.util.spec_from_file_location` now loads from the VFS instead of the host
+FS, which took **build-system-task-ordering** and **raft-log-repair-concurrent-access**
+from 0.0 → 1.0.
+
+**A per-rollout trust signal** — the piece that makes a 66%-faithful sim *safe* to train
+on. Every command declares a trust level; the harness emits `trust ∈ {high, medium, low}`
++ the offending `trust_gaps` next to the reward:
+
+- `high` — nothing consequential was stubbed; the reward should match a real machine.
+- `medium` — a dependency installer (`pip`/…) or an unknown tool was stubbed.
+- `low` — a real-execution command ran as a no-op (compiler / runtime / server), **or** a
+  known third-party module failed to import (`numpy`/`pandas`/…).
+
+What it buys: **all 9 tasks where the sandbox produces a correct non-zero reward read
+`high`**; numpy/pandas tasks read `low import:*`; node/server tasks read `low`. The
+distribution over the 72 tasks is high 28 / medium 18 / low 21 (5 error). A training
+pipeline trusts `high`, samples `medium`, and routes `low` to a real sandbox.
+
+**Honest limitation.** The signal flags *resource* gaps (missing deps, runtimes, tools)
+reliably, but it cannot catch *logic* divergence — a handful of tasks run end-to-end and
+return a wrong reward while reading `high` (e.g. a subtle `subprocess`/CLI-fidelity gap).
+Those are exactly what the ground-truth eval harness exists to catch, which is why both
+the signal *and* the harness-in-CI are part of the recommendation, not either alone.
 
 ## Appendix — reproducing
 
 ```sh
 cargo build --release --features python
-./target/release/shellsim task <tblite-task-dir>     # run one task, print reward JSON
+./target/release/shellsim task <tblite-task-dir>     # run one task, print reward+trust JSON
 ./target/release/shellsim bench --json <corpus-dir>  # run the whole corpus
-python3 /tmp/gt_run.py <task-dirs...>                # real-CPython ground truth
-python3 /tmp/analyze_compare.py                      # sim-vs-gt classification
+# faithfulness harness (see eval/README.md):
+python3 eval/gt_run.py <task-dirs...>                # real-CPython ground truth
+python3 eval/analyze_compare.py                      # sim-vs-gt classification
 ```

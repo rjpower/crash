@@ -16,9 +16,11 @@ See **[REPORT.md](REPORT.md)** for the full design, validation methodology, and 
   a minimal `pytest` (with fixtures).
 - `sleep`/`timeout`/background jobs are driven by a **virtual clock** (no real blocking).
 - `curl`/`wget` resolve a **virtual route table** (`net route …`) — no real egress.
+- A per-rollout **trust signal** (`high`/`medium`/`low`) so a training pipeline knows when
+  to trust the simulated reward vs. fall back to a real sandbox.
 - **Validated against real CPython:** on the 57 OpenThoughts-TBLite tasks where both a
   faithful oracle and our sandbox can be scored, the sandbox reproduces the real reward
-  exactly 63% of the time — including byte-exact fractional partial credit (0.922, 0.8825).
+  exactly 66% of the time — including byte-exact fractional partial credit (0.922, 0.8825).
 
 ## Build
 
