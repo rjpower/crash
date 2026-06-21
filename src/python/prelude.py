@@ -768,6 +768,142 @@ _subprocess.getstatusoutput = _sp_getstatusoutput
 _subprocess.Popen = _Popen
 sys.modules['subprocess'] = _subprocess
 
+# ---- importlib shim: load source from the VFS, not the host filesystem ----
+# Verifiers commonly do:
+#   spec = importlib.util.spec_from_file_location("mod", "/app/solution.py")
+#   mod = importlib.util.module_from_spec(spec)
+#   spec.loader.exec_module(mod)
+# RustPython's real importlib would read /app/solution.py off the HOST disk and raise
+# FileNotFoundError. We replace spec_from_file_location/module_from_spec so that, when the
+# path lives in the VFS, the source is compiled+exec'd from _VFS_FILES instead. Anything that
+# is NOT a VFS file (or not a recognized location) defers to the real importlib, so ordinary
+# `import json` / `import re` stdlib machinery is untouched.
+import importlib as _importlib
+import importlib.util as _importlib_util
+
+_real_spec_from_file_location = _importlib_util.spec_from_file_location
+_real_module_from_spec = _importlib_util.module_from_spec
+
+class _VfsLoader:
+    def __init__(self, name, path):
+        self.name = name
+        self.path = path
+    def get_filename(self, name=None):
+        return self.path
+    def get_source(self, name=None):
+        data = _VFS_FILES.get(self.path)
+        if data is None:
+            raise FileNotFoundError(2, 'No such file or directory: ' + self.path)
+        return data.decode('utf-8') if isinstance(data, (bytes, bytearray)) else data
+    def get_code(self, name=None):
+        return compile(self.get_source(name), self.path, 'exec')
+    def is_package(self, name=None):
+        return self.path.endswith('/__init__.py')
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        code = self.get_code(getattr(module, '__name__', self.name))
+        d = module.__dict__
+        d.setdefault('__file__', self.path)
+        d.setdefault('__name__', getattr(module, '__name__', self.name))
+        exec(code, d)
+        return module
+    def load_module(self, name=None):
+        nm = name or self.name
+        mod = sys.modules.get(nm)
+        if mod is None:
+            mod = types.ModuleType(nm)
+            sys.modules[nm] = mod
+        mod.__file__ = self.path
+        mod.__loader__ = self
+        self.exec_module(mod)
+        return mod
+
+class _VfsSpec:
+    def __init__(self, name, path, is_pkg=False):
+        self.name = name
+        self.loader = _VfsLoader(name, path)
+        self.origin = path
+        self.cached = None
+        self.has_location = True
+        if is_pkg:
+            self.submodule_search_locations = [posixpath.dirname(path)]
+        else:
+            self.submodule_search_locations = None
+        self.parent = name.rpartition('.')[0]
+        self.loader_state = None
+
+def _vfs_spec_from_file_location(name, location=None, *args, **kwargs):
+    # only intercept when we actually have a VFS-backed source file at `location`.
+    if location is not None:
+        p = _vfs_norm(location)
+        if p in _VFS_FILES:
+            return _VfsSpec(name, p, is_pkg=p.endswith('/__init__.py'))
+    # not in the VFS: defer to the real implementation (host stdlib path).
+    return _real_spec_from_file_location(name, location, *args, **kwargs)
+
+def _vfs_module_from_spec(spec):
+    if isinstance(spec, _VfsSpec):
+        mod = types.ModuleType(spec.name)
+        mod.__spec__ = spec
+        mod.__loader__ = spec.loader
+        mod.__file__ = spec.origin
+        if spec.submodule_search_locations is not None:
+            mod.__path__ = list(spec.submodule_search_locations)
+        sys.modules[spec.name] = mod
+        return mod
+    return _real_module_from_spec(spec)
+
+_importlib_util.spec_from_file_location = _vfs_spec_from_file_location
+_importlib_util.module_from_spec = _vfs_module_from_spec
+# importlib.util is also reachable as the `util` attribute on the importlib package.
+try:
+    _importlib.util.spec_from_file_location = _vfs_spec_from_file_location
+    _importlib.util.module_from_spec = _vfs_module_from_spec
+except Exception:
+    pass
+
+# import_module / reload: fall back to the VFS sibling-module behavior when the real
+# importlib can't find the module (it would otherwise probe the host filesystem). The real
+# implementation is tried first so stdlib imports keep working unchanged.
+_real_import_module = _importlib.import_module
+_real_reload = getattr(_importlib, 'reload', None)
+
+def _vfs_import_module(name, package=None):
+    if name in sys.modules:
+        return sys.modules[name]
+    try:
+        return _real_import_module(name, package)
+    except Exception:
+        # locate `<name>.py` on the sandbox path inside the VFS and exec it.
+        rel = name.replace('.', '/')
+        for d in __PYPATH:
+            for cand in (d.rstrip('/') + '/' + rel + '.py',
+                         d.rstrip('/') + '/' + rel + '/__init__.py'):
+                cc = _vfs_norm(cand)
+                if cc in _VFS_FILES:
+                    spec = _VfsSpec(name, cc, is_pkg=cc.endswith('/__init__.py'))
+                    mod = _vfs_module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    return mod
+        raise
+_importlib.import_module = _vfs_import_module
+
+def _vfs_reload(module):
+    spec = getattr(module, '__spec__', None)
+    loader = getattr(spec, 'loader', None) if spec is not None else None
+    if isinstance(loader, _VfsLoader):
+        loader.exec_module(module)
+        return module
+    f = getattr(module, '__file__', None)
+    if f is not None and _vfs_norm(f) in _VFS_FILES:
+        _VfsLoader(getattr(module, '__name__', ''), _vfs_norm(f)).exec_module(module)
+        return module
+    if _real_reload is not None:
+        return _real_reload(module)
+    return module
+_importlib.reload = _vfs_reload
+
 # ---- VFS-backed importer for sibling modules ----
 def _preload_modules():
     loaded = {}
