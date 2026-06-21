@@ -22,6 +22,10 @@ pub struct TaskResult {
     pub unsupported: Vec<String>,
     pub commands: Vec<String>,
     pub virtual_slept_ms: u64,
+    /// "high" if no NoOp/Partial command ran during the task, else "low".
+    pub trust: String,
+    /// Names of any NoOp/Partial-trust commands that ran (empty when `trust == "high"`).
+    pub trust_gaps: Vec<String>,
 }
 
 pub fn run_task(task_dir: &Path) -> TaskResult {
@@ -38,6 +42,8 @@ pub fn run_task(task_dir: &Path) -> TaskResult {
             unsupported: vec![],
             commands: vec![],
             virtual_slept_ms: 0,
+            trust: "high".into(),
+            trust_gaps: vec![],
         };
     }
 
@@ -119,6 +125,13 @@ pub fn run_task(task_dir: &Path) -> TaskResult {
 
     let unsupported = dedup(interp.unsupported.clone());
     let commands = dedup(interp.cmd_trace.clone());
+
+    // Trust verdict: "high" only if no NoOp/Partial-trust command ran during the task.
+    let mut trust_gaps: Vec<String> =
+        interp.trust_noop.iter().chain(interp.trust_partial.iter()).cloned().collect();
+    trust_gaps.sort();
+    trust_gaps.dedup();
+    let trust = if trust_gaps.is_empty() { "high" } else { "low" }.to_string();
     let (reward, passed, status, note) = match reward {
         Some(r) => {
             let passed = r >= 0.999;
@@ -147,6 +160,8 @@ pub fn run_task(task_dir: &Path) -> TaskResult {
         unsupported,
         commands,
         virtual_slept_ms: interp.clock.slept_ms,
+        trust,
+        trust_gaps,
     }
 }
 

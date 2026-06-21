@@ -137,6 +137,8 @@ fn bench(args: &[String]) {
                 unsupported: vec![],
                 commands: vec![],
                 virtual_slept_ms: 0,
+                trust: "low".into(),
+                trust_gaps: vec![],
             });
         eprintln!("{:8} reward={}", r.status, r.reward);
         results.push(r);

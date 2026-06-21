@@ -55,6 +55,10 @@ pub struct Interp {
     pub cmd_trace: Vec<String>,
     /// commands requested that we don't implement (coverage gaps)
     pub unsupported: Vec<String>,
+    /// command names that ran as `Trust::NoOp` (ignored — e.g. apt-get) during this run
+    pub trust_noop: std::collections::BTreeSet<String>,
+    /// command names that ran as `Trust::Partial` (subset impl — e.g. jq/sed) during this run
+    pub trust_partial: std::collections::BTreeSet<String>,
 }
 
 impl Interp {
@@ -99,6 +103,8 @@ impl Interp {
             input_pos: 0,
             cmd_trace: Vec::new(),
             unsupported: Vec::new(),
+            trust_noop: std::collections::BTreeSet::new(),
+            trust_partial: std::collections::BTreeSet::new(),
         }
     }
 
