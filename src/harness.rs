@@ -126,12 +126,22 @@ pub fn run_task(task_dir: &Path) -> TaskResult {
     let unsupported = dedup(interp.unsupported.clone());
     let commands = dedup(interp.cmd_trace.clone());
 
-    // Trust verdict: "high" only if no NoOp/Partial-trust command ran during the task.
-    let mut trust_gaps: Vec<String> =
-        interp.trust_noop.iter().chain(interp.trust_partial.iter()).cloned().collect();
-    trust_gaps.sort();
-    trust_gaps.dedup();
-    let trust = if trust_gaps.is_empty() { "high" } else { "low" }.to_string();
+    // Trust verdict: how much to trust this simulated reward as a stand-in for a real machine.
+    // Fold in Python third-party import failures (a module the task needed wasn't available) —
+    // these are not shell no-ops but are an equally strong "this reward is unreliable" signal.
+    let (mut trust, mut trust_gaps) = trust_verdict(&interp.trust_noop, &interp.trust_partial);
+    let mut missing = missing_modules(&String::from_utf8_lossy(&err));
+    missing.extend(missing_modules(&String::from_utf8_lossy(&verr)));
+    missing.sort();
+    missing.dedup();
+    if !missing.is_empty() {
+        trust = "low".to_string();
+        for m in &missing {
+            trust_gaps.push(format!("import:{m}"));
+        }
+        trust_gaps.sort();
+        trust_gaps.dedup();
+    }
     let (reward, passed, status, note) = match reward {
         Some(r) => {
             let passed = r >= 0.999;
@@ -163,6 +173,75 @@ pub fn run_task(task_dir: &Path) -> TaskResult {
         trust,
         trust_gaps,
     }
+}
+
+/// Classify how trustworthy a simulated reward is, from which *no-op'd* commands actually ran.
+///
+/// - `high`   — nothing consequential was stubbed; the reward should match a real machine.
+/// - `medium` — a dependency installer was stubbed (`pip`/`conda`/`npm install`/…). The reward
+///   is usually right, but if the task's code actually *uses* that dependency it could be wrong
+///   — worth spot-checking against a real sandbox.
+/// - `low`    — a command that genuinely needs real execution ran as a no-op (compiler, language
+///   runtime, container/service). The reward is not reliable; route this task to a real sandbox.
+///
+/// Only no-op'd commands feed the verdict. `apt-get`/`add-apt-repository`/etc. are pure system
+/// bootstrap that can't change a simulable task's reward and are ignored. Partial-fidelity tools
+/// (the `jq`/`sed` subsets) are *not* counted here — they produce real output, so any divergence
+/// shows up as a wrong reward and is caught by the ground-truth eval harness, not by this flag.
+/// Extract *known third-party* module names from `ModuleNotFoundError: No module named 'X'`
+/// tracebacks. Only an uncaught failure prints this line, so a `try/except ImportError` won't
+/// trip it. We restrict to a curated heavy-dependency set so that a handled/local import of e.g.
+/// `model` doesn't false-flag a faithful task; a missing `numpy`/`pandas` is unambiguous.
+fn missing_modules(stderr: &str) -> Vec<String> {
+    const THIRD_PARTY: &[&str] = &[
+        "numpy", "pandas", "scipy", "sklearn", "scikit", "torch", "tensorflow", "keras",
+        "matplotlib", "seaborn", "flask", "django", "fastapi", "starlette", "requests", "httpx",
+        "aiohttp", "redis", "fakeredis", "celery", "lxml", "bs4", "sqlalchemy", "psycopg2",
+        "pymongo", "boto3", "cryptography", "nacl", "jwt", "PIL", "cv2", "skimage", "networkx",
+        "sympy", "statsmodels", "xgboost", "lightgbm", "transformers", "datasets", "rdkit",
+        "openai", "anthropic", "yaml", "toml", "openpyxl", "pyarrow", "polars", "numba",
+    ];
+    let mut out = Vec::new();
+    for line in stderr.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("ModuleNotFoundError: No module named ") {
+            let name = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+            let top = name.split('.').next().unwrap_or(name);
+            if THIRD_PARTY.contains(&top) {
+                out.push(top.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn trust_verdict(
+    noop: &std::collections::BTreeSet<String>,
+    _partial: &std::collections::BTreeSet<String>,
+) -> (String, Vec<String>) {
+    // System bootstrap that can't change a pure-simulation reward — ignored.
+    const BENIGN: &[&str] = &[
+        "apt", "apt-get", "apt-cache", "add-apt-repository", "update-alternatives", "dpkg",
+        "dpkg-reconfigure", "ldconfig", "groupadd", "useradd", "usermod",
+    ];
+    // Stubbing these genuinely needs real execution — the reward can't be trusted.
+    const CONSEQUENTIAL: &[&str] = &[
+        "gcc", "g++", "cc", "clang", "make", "cmake", "node", "cargo", "go", "javac", "java",
+        "mvn", "gradle", "bazel", "docker", "docker-compose", "systemctl", "service", "uvicorn",
+        "gunicorn", "flask", "redis-server", "mongod", "mysqld", "postgres", "nginx", "rustc",
+    ];
+    let mut gaps: Vec<String> =
+        noop.iter().filter(|c| !BENIGN.contains(&c.as_str())).cloned().collect();
+    gaps.sort();
+    gaps.dedup();
+    let trust = if gaps.is_empty() {
+        "high"
+    } else if gaps.iter().any(|c| CONSEQUENTIAL.contains(&c.as_str())) {
+        "low"
+    } else {
+        "medium"
+    };
+    (trust.to_string(), gaps)
 }
 
 fn is_stub(src: &str) -> bool {

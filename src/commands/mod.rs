@@ -103,7 +103,10 @@ pub fn run(interp: &mut Interp, argv: &[String], stdin: Vec<u8>, out: &mut Vec<u
     if let Some(code) = util::try_exec_script(interp, cmd, args, &stdin, out, err) {
         return code;
     }
+    // An unknown command the task actually invoked (a missing tool, a compiled binary we can't
+    // run, …) is a genuine simulation gap — record it so the trust verdict reflects it.
     interp.note_unsupported(cmd);
+    interp.trust_noop.insert(cmd.to_string());
     util::ewln(err, &format!("{cmd}: command not found"));
     127
 }
