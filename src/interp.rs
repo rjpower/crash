@@ -1,10 +1,19 @@
 //! Interpreter state shared across the shell executor and all commands.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::clock::Clock;
 use crate::net::VirtualNet;
 use crate::vfs::Vfs;
+
+/// A bash array value. Indexed arrays are sparse (`arr[5]=x` on an empty array is legal),
+/// so unset slots are `None`. Associative arrays preserve sorted key order (bash uses an
+/// unspecified hash order; sorted is deterministic and good enough for our checks).
+#[derive(Clone, Debug)]
+pub enum ArrayVal {
+    Indexed(Vec<Option<String>>),
+    Assoc(BTreeMap<String, String>),
+}
 
 /// A simulated background job (started with `&`). Because there is no real concurrency,
 /// a job is just a captured AST that will be run-to-completion when the scheduler decides
@@ -24,6 +33,9 @@ pub struct Interp {
     /// shell + environment variables (we don't distinguish exported vs not for simplicity,
     /// except that `env`/child python only sees exported ones, tracked in `exported`)
     pub vars: HashMap<String, String>,
+    /// bash arrays (indexed + associative), keyed by variable name. A name present here is an
+    /// array; it shadows any scalar `vars` entry of the same name for `${name[...]}` access.
+    pub arrays: HashMap<String, ArrayVal>,
     pub exported: std::collections::BTreeSet<String>,
     pub cwd: String,
     pub funcs: HashMap<String, crate::shell::Node>,
@@ -82,6 +94,7 @@ impl Interp {
             clock: Clock::new(),
             net: VirtualNet::new(),
             vars,
+            arrays: HashMap::new(),
             exported,
             cwd: "/".to_string(),
             funcs: HashMap::new(),
@@ -122,6 +135,10 @@ impl Interp {
                     }
                     return self.positional.get(n - 1).cloned();
                 }
+                // A bare reference to an array name yields element 0 (`$arr` == `${arr[0]}`).
+                if self.arrays.contains_key(name) {
+                    return Some(self.array_get(name, "0").unwrap_or_default());
+                }
                 self.vars.get(name).cloned()
             }
         }
@@ -132,11 +149,142 @@ impl Interp {
         if name == "PWD" {
             self.cwd = val.clone();
         }
+        // A plain scalar assignment to an array name in bash sets element 0; we instead treat it
+        // as a fresh scalar (drop the array) — the common case in our scripts and lower-risk.
+        self.arrays.remove(name);
         self.vars.insert(name.to_string(), val);
     }
 
     pub fn export(&mut self, name: &str) {
         self.exported.insert(name.to_string());
+    }
+
+    // ===================== arrays =====================
+
+    pub fn is_array(&self, name: &str) -> bool {
+        self.arrays.contains_key(name)
+    }
+
+    /// Ensure `name` exists as an *indexed* array. If it was a plain scalar, bash promotes it
+    /// so that the old scalar becomes element 0 (`x=1; x[2]=3` ⇒ x[0]=1).
+    fn ensure_indexed(&mut self, name: &str) {
+        if !self.arrays.contains_key(name) {
+            let mut v: Vec<Option<String>> = Vec::new();
+            if let Some(s) = self.vars.get(name).cloned() {
+                v.push(Some(s));
+            }
+            self.arrays.insert(name.to_string(), ArrayVal::Indexed(v));
+        }
+    }
+
+    /// Ensure `name` exists as an *associative* array (created empty if absent).
+    pub fn declare_assoc(&mut self, name: &str) {
+        if !matches!(self.arrays.get(name), Some(ArrayVal::Assoc(_))) {
+            self.arrays.insert(name.to_string(), ArrayVal::Assoc(BTreeMap::new()));
+        }
+    }
+
+    /// Ensure `name` exists as an indexed array (created empty if absent).
+    pub fn declare_indexed(&mut self, name: &str) {
+        self.ensure_indexed(name);
+    }
+
+    /// Replace the whole array at `name` with the given element list (indexed).
+    pub fn set_array(&mut self, name: &str, elems: Vec<String>) {
+        self.vars.remove(name);
+        self.arrays
+            .insert(name.to_string(), ArrayVal::Indexed(elems.into_iter().map(Some).collect()));
+    }
+
+    /// Append elements to the end of an indexed array (creating/promoting as needed). For an
+    /// associative array, callers should use `array_set` per key; this is indexed-only.
+    pub fn array_append(&mut self, name: &str, elems: Vec<String>) {
+        self.ensure_indexed(name);
+        if let Some(ArrayVal::Indexed(v)) = self.arrays.get_mut(name) {
+            for e in elems {
+                v.push(Some(e));
+            }
+        }
+    }
+
+    /// Assign `value` to a subscript. For an associative array `key` is the literal key; for an
+    /// indexed array `key` is parsed as an integer index (sparse — gaps become `None`).
+    pub fn array_set(&mut self, name: &str, key: &str, value: String) {
+        match self.arrays.get_mut(name) {
+            Some(ArrayVal::Assoc(m)) => {
+                m.insert(key.to_string(), value);
+            }
+            _ => {
+                self.ensure_indexed(name);
+                if let Some(ArrayVal::Indexed(v)) = self.arrays.get_mut(name) {
+                    let idx = key.trim().parse::<usize>().unwrap_or(0);
+                    if idx >= v.len() {
+                        v.resize(idx + 1, None);
+                    }
+                    v[idx] = Some(value);
+                }
+            }
+        }
+    }
+
+    /// Look up one subscript value.
+    pub fn array_get(&self, name: &str, key: &str) -> Option<String> {
+        match self.arrays.get(name) {
+            Some(ArrayVal::Assoc(m)) => m.get(key).cloned(),
+            Some(ArrayVal::Indexed(v)) => {
+                let idx = key.trim().parse::<usize>().ok()?;
+                v.get(idx).and_then(|o| o.clone())
+            }
+            None => None,
+        }
+    }
+
+    /// All set values in order (`${arr[@]}` / `${arr[*]}`).
+    pub fn array_all(&self, name: &str) -> Vec<String> {
+        match self.arrays.get(name) {
+            Some(ArrayVal::Assoc(m)) => m.values().cloned().collect(),
+            Some(ArrayVal::Indexed(v)) => v.iter().filter_map(|o| o.clone()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Keys/indices of set elements (`${!arr[@]}`).
+    pub fn array_keys(&self, name: &str) -> Vec<String> {
+        match self.arrays.get(name) {
+            Some(ArrayVal::Assoc(m)) => m.keys().cloned().collect(),
+            Some(ArrayVal::Indexed(v)) => v
+                .iter()
+                .enumerate()
+                .filter_map(|(i, o)| o.as_ref().map(|_| i.to_string()))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Count of set elements (`${#arr[@]}`).
+    pub fn array_len(&self, name: &str) -> usize {
+        match self.arrays.get(name) {
+            Some(ArrayVal::Assoc(m)) => m.len(),
+            Some(ArrayVal::Indexed(v)) => v.iter().filter(|o| o.is_some()).count(),
+            None => 0,
+        }
+    }
+
+    /// Unset one subscript (an element); returns true if the name remained an array.
+    pub fn array_unset_elem(&mut self, name: &str, key: &str) {
+        match self.arrays.get_mut(name) {
+            Some(ArrayVal::Assoc(m)) => {
+                m.remove(key);
+            }
+            Some(ArrayVal::Indexed(v)) => {
+                if let Ok(idx) = key.trim().parse::<usize>() {
+                    if idx < v.len() {
+                        v[idx] = None;
+                    }
+                }
+            }
+            None => {}
+        }
     }
 
     /// Environment map visible to a child process (e.g. the python engine).

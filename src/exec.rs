@@ -303,17 +303,13 @@ fn exec_command(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<
         _ => unreachable!(),
     };
 
-    // Expand assignment values.
-    let expanded_assigns: Vec<(String, String)> = assigns
-        .iter()
-        .map(|(k, v)| (k.clone(), expand_word(interp, v, false).join(" ")))
-        .collect();
-
-    // No command words → assignments are persistent.
-    let argv = expand_words(interp, words);
+    // No command words → assignments are persistent (including array assignments).
+    // Words that look like array-assignment literals (`name=( … )`, `name[i]=v`) are kept
+    // verbatim — they must not be word-split/globbed — so `declare`/`local` can parse them.
+    let argv = expand_argv(interp, words);
     if argv.is_empty() {
-        for (k, v) in expanded_assigns {
-            interp.set_var(&k, v);
+        for (k, v) in assigns {
+            apply_assignment(interp, k, v);
         }
         // a bare redirection like `> file` still truncates
         if !redirects.is_empty() {
@@ -322,6 +318,13 @@ fn exec_command(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<
         }
         return 0;
     }
+
+    // With command words, the leading assignments are temporary (scalar only here; array
+    // command-prefixes don't occur in our corpus). Expand scalar values for set/restore.
+    let expanded_assigns: Vec<(String, String)> = assigns
+        .iter()
+        .map(|(k, v)| (k.clone(), expand_word(interp, v, false).join(" ")))
+        .collect();
 
     // Set up redirects.
     let plan = plan_redirects(interp, redirects);
@@ -366,6 +369,252 @@ fn exec_command(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<
 
     apply_outputs(interp, &plan, &local_out, &local_err, out, err);
     status
+}
+
+/// Expand a command's argv, but keep array-assignment literal words verbatim so the builtin
+/// (`declare`/`local`/`typeset`/`readonly`) can parse them itself.
+fn expand_argv(interp: &mut Interp, words: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in words {
+        if is_array_assign_word(w) {
+            out.push(w.clone());
+        } else {
+            out.extend(expand_word(interp, w, true));
+        }
+    }
+    out
+}
+
+/// True if `w` is an array-assignment literal that must not be split/globbed:
+/// `name=( … )`, `name+=( … )`, `name[sub]=…`, `name[sub]+=…`.
+pub fn is_array_assign_word(w: &str) -> bool {
+    let eq = match w.find('=') {
+        Some(0) | None => return false,
+        Some(e) => e,
+    };
+    let mut lhs = &w[..eq];
+    if let Some(s) = lhs.strip_suffix('+') {
+        lhs = s;
+    }
+    let has_subscript = lhs.contains('[') && lhs.ends_with(']');
+    let is_array_literal = w[eq + 1..].trim_start().starts_with('(');
+    if !has_subscript && !is_array_literal {
+        return false;
+    }
+    // validate the name part
+    let name = lhs.split('[').next().unwrap_or(lhs);
+    !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+}
+
+/// Apply one assignment word (`name=val`, `name+=val`, `name[sub]=val`, `name=( … )`, etc.).
+/// `raw_key` retains any `[subscript]` and a trailing `+` (append); `raw_val` is unexpanded.
+pub fn apply_assignment(interp: &mut Interp, raw_key: &str, raw_val: &str) {
+    // Decode `+=` (append) and an optional `[subscript]`.
+    let (key_body, append) = match raw_key.strip_suffix('+') {
+        Some(b) => (b, true),
+        None => (raw_key, false),
+    };
+    let (name, subscript) = match key_body.find('[') {
+        Some(br) if key_body.ends_with(']') => {
+            (&key_body[..br], Some(&key_body[br + 1..key_body.len() - 1]))
+        }
+        _ => (key_body, None),
+    };
+
+    // Array literal value: `( … )`.
+    let trimmed = raw_val.trim();
+    if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        // Associative literal? Detect `[key]=val` pairs.
+        let assoc_existing = matches!(interp.arrays.get(name), Some(crate::interp::ArrayVal::Assoc(_)));
+        if !append {
+            // fresh array
+            if assoc_existing {
+                if let Some(crate::interp::ArrayVal::Assoc(m)) = interp.arrays.get_mut(name) {
+                    m.clear();
+                }
+            } else {
+                interp.declare_indexed(name);
+                if let Some(crate::interp::ArrayVal::Indexed(v)) = interp.arrays.get_mut(name) {
+                    v.clear();
+                }
+            }
+        }
+        for (subkey, val) in parse_array_elems(interp, inner, assoc_existing) {
+            match subkey {
+                Some(k) => {
+                    if assoc_existing {
+                        interp.array_set(name, &k, val);
+                    } else {
+                        // indexed array with explicit [i]=val
+                        interp.array_set(name, &k, val);
+                    }
+                }
+                None => interp.array_append(name, vec![val]),
+            }
+        }
+        return;
+    }
+
+    // Subscripted scalar assignment: name[sub]=val (val expanded, no splitting).
+    if let Some(sub) = subscript {
+        let sub_key = expand_word(interp, sub, false).join(" ");
+        let val = expand_word(interp, raw_val, false).join(" ");
+        if append {
+            let prev = interp.array_get(name, &sub_key).unwrap_or_default();
+            interp.array_set(name, &sub_key, format!("{prev}{val}"));
+        } else {
+            interp.array_set(name, &sub_key, val);
+        }
+        return;
+    }
+
+    // Plain scalar (or scalar-append). If the name is already an array, += appends an element
+    // (bash: `arr+=str` is `arr[0]+=str`, but `arr+=(x)` was handled above).
+    let val = expand_word(interp, raw_val, false).join(" ");
+    if append {
+        if interp.is_array(name) {
+            // `arr+=val` on an array appends to element 0
+            let prev = interp.array_get(name, "0").unwrap_or_default();
+            interp.array_set(name, "0", format!("{prev}{val}"));
+        } else {
+            let prev = interp.get_var(name).unwrap_or_default();
+            interp.set_var(name, format!("{prev}{val}"));
+        }
+    } else {
+        interp.set_var(name, val);
+    }
+}
+
+/// Split an array-literal body into (optional explicit key, expanded value) pairs.
+/// Each top-level word undergoes expansion + word-splitting (so `$(cmd)` splits on IFS and
+/// `"$x"` stays one element). `[key]=val` forms yield an explicit key.
+fn parse_array_elems(interp: &mut Interp, inner: &str, _assoc: bool) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    for tok in split_top_level_words(inner) {
+        // explicit subscript form: [key]=value
+        if let Some(rest) = tok.strip_prefix('[') {
+            if let Some(close) = rest.find(']') {
+                let key_raw = &rest[..close];
+                let after = &rest[close + 1..];
+                if let Some(val_raw) = after.strip_prefix('=') {
+                    let key = expand_word(interp, key_raw, false).join(" ");
+                    let val = expand_word(interp, val_raw, false).join(" ");
+                    out.push((Some(key), val));
+                    continue;
+                }
+            }
+        }
+        // ordinary element: expand with splitting+globbing
+        for v in expand_word(interp, &tok, true) {
+            out.push((None, v));
+        }
+    }
+    out
+}
+
+/// Split a string into shell words at unquoted whitespace, preserving quotes/`$( )`/`${ }`.
+fn split_top_level_words(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            ' ' | '\t' | '\n' => {
+                if started {
+                    words.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+                i += 1;
+            }
+            '\'' => {
+                cur.push(c);
+                started = true;
+                i += 1;
+                while i < chars.len() {
+                    cur.push(chars[i]);
+                    i += 1;
+                    if chars[i - 1] == '\'' {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                cur.push(c);
+                started = true;
+                i += 1;
+                while i < chars.len() {
+                    let d = chars[i];
+                    cur.push(d);
+                    i += 1;
+                    if d == '\\' && i < chars.len() {
+                        cur.push(chars[i]);
+                        i += 1;
+                        continue;
+                    }
+                    if d == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                cur.push(c);
+                started = true;
+                i += 1;
+                if i < chars.len() {
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                started = true;
+                let mut depth = 0;
+                cur.push(chars[i]);
+                i += 1;
+                while i < chars.len() {
+                    let d = chars[i];
+                    cur.push(d);
+                    i += 1;
+                    if d == '(' {
+                        depth += 1;
+                    } else if d == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            '`' => {
+                started = true;
+                cur.push(c);
+                i += 1;
+                while i < chars.len() {
+                    cur.push(chars[i]);
+                    i += 1;
+                    if chars[i - 1] == '`' {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                cur.push(c);
+                started = true;
+                i += 1;
+            }
+        }
+    }
+    if started {
+        words.push(cur);
+    }
+    words
 }
 
 fn exec_pipeline(interp: &mut Interp, stages: &[Node], stdin: Vec<u8>, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
@@ -445,4 +694,83 @@ fn glob_to_regex_body(pat: &str) -> String {
         }
     }
     re
+}
+
+#[cfg(test)]
+mod array_tests {
+    use crate::interp::Interp;
+
+    /// Run a snippet and capture stdout as a String.
+    fn run(src: &str) -> String {
+        let mut i = Interp::new();
+        let ast = crate::shell::parse(src);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        crate::exec::exec(&mut i, &ast, Vec::new(), &mut out, &mut err);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn indexed_basics() {
+        assert_eq!(run(r#"a=(x y z); echo "${a[1]} ${#a[@]} ${a[@]}""#), "y 3 x y z\n");
+    }
+
+    #[test]
+    fn append_and_count() {
+        assert_eq!(run(r#"a=(x y z); a+=(w v); echo "${#a[@]} ${a[@]}""#), "5 x y z w v\n");
+    }
+
+    #[test]
+    fn sparse_indices_and_values() {
+        assert_eq!(run(r#"a=(1 2 3); a[5]=six; echo "${!a[@]}"; echo "${a[@]}""#), "0 1 2 5\n1 2 3 six\n");
+    }
+
+    #[test]
+    fn scalar_promotes_to_array() {
+        assert_eq!(run(r#"x=1; x[2]=3; echo "${x[0]} ${x[2]} ${#x[@]}""#), "1 3 2\n");
+    }
+
+    #[test]
+    fn bare_ref_is_element_zero() {
+        assert_eq!(run(r#"a=(p q r); echo "$a ${a}""#), "p p\n");
+    }
+
+    #[test]
+    fn quoted_at_separate_words() {
+        // each element stays a single word even with embedded spaces
+        let out = run(r#"a=("one two" three); for x in "${a[@]}"; do echo "[$x]"; done"#);
+        assert_eq!(out, "[one two]\n[three]\n");
+    }
+
+    #[test]
+    fn empty_array_iterates_zero_times() {
+        assert_eq!(run(r#"a=(); for x in "${a[@]}"; do echo "X$x"; done; echo done"#), "done\n");
+    }
+
+    #[test]
+    fn command_substitution_splits() {
+        assert_eq!(run(r#"a=($(printf "f1\nf2\nf3\n")); echo "${#a[@]} ${a[1]}""#), "3 f2\n");
+    }
+
+    #[test]
+    fn associative_get_keys_count() {
+        // sorted key order is deterministic in our impl
+        assert_eq!(run(r#"declare -A m; m[foo]=1; m[bar]=2; echo "${m[foo]} ${!m[@]} ${#m[@]}""#), "1 bar foo 2\n");
+    }
+
+    #[test]
+    fn associative_literal_and_arith() {
+        let out = run(r#"declare -A m=([a]=0 [b]=5); m[a]=$((${m[a]} + 1)); echo "${m[a]} ${m[b]}""#);
+        assert_eq!(out, "1 5\n");
+    }
+
+    #[test]
+    fn slice_and_last() {
+        assert_eq!(run(r#"a=(a b c d e); echo "${a[@]:1:2}"; echo "${a[@]: -1}""#), "b c\ne\n");
+    }
+
+    #[test]
+    fn unset_element() {
+        assert_eq!(run(r#"a=(1 2 3 4); unset "a[1]"; echo "${a[@]} ${!a[@]}""#), "1 3 4 0 2 3\n");
+    }
 }

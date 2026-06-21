@@ -321,6 +321,12 @@ impl Lexer {
 
     fn read_word(&mut self) -> String {
         let mut w = String::new();
+        // Array assignment literal: `name=( … )` or `name+=( … )` (optionally a `name[idx]=…`
+        // form is handled later as an ordinary word). Absorb the parenthesized element list so
+        // the parser sees it as one assignment word rather than an empty assign + a subshell.
+        if let Some(consumed) = self.try_array_assign_prefix() {
+            w.push_str(&consumed);
+        }
         while let Some(c) = self.peek() {
             match c {
                 ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>' => break,
@@ -392,6 +398,103 @@ impl Lexer {
             }
         }
         w
+    }
+
+    /// If the word at the cursor is an array-assignment literal `name=( … )` or `name+=( … )`,
+    /// consume `name`, the `=`/`+=`, and the whole balanced `( … )` (honoring quotes), and return
+    /// the consumed text. Otherwise consume nothing and return `None`.
+    fn try_array_assign_prefix(&mut self) -> Option<String> {
+        let start = self.i;
+        // identifier
+        let mut j = self.i;
+        if !matches!(self.chars.get(j), Some(c) if c.is_ascii_alphabetic() || *c == '_') {
+            return None;
+        }
+        while matches!(self.chars.get(j), Some(c) if c.is_ascii_alphanumeric() || *c == '_') {
+            j += 1;
+        }
+        // optional += / =
+        if self.chars.get(j) == Some(&'+') && self.chars.get(j + 1) == Some(&'=') {
+            j += 2;
+        } else if self.chars.get(j) == Some(&'=') {
+            j += 1;
+        } else {
+            return None;
+        }
+        if self.chars.get(j) != Some(&'(') {
+            return None;
+        }
+        // commit: copy name..='(' then read balanced parens
+        let prefix: String = self.chars[start..j].iter().collect();
+        self.i = j;
+        let parens = self.read_balanced_paren_quoted();
+        Some(format!("{prefix}{parens}"))
+    }
+
+    /// Read a balanced `( … )` group starting at the current `(`, copying quoted regions
+    /// verbatim (so `arr=("$x" 'a b')` keeps the spaces and `)` inside quotes is ignored).
+    fn read_balanced_paren_quoted(&mut self) -> String {
+        let mut out = String::new();
+        let mut depth = 0;
+        while let Some(c) = self.peek() {
+            match c {
+                '\'' => {
+                    out.push(c);
+                    self.i += 1;
+                    while let Some(n) = self.peek() {
+                        out.push(n);
+                        self.i += 1;
+                        if n == '\'' {
+                            break;
+                        }
+                    }
+                }
+                '"' => {
+                    out.push(c);
+                    self.i += 1;
+                    while let Some(n) = self.peek() {
+                        out.push(n);
+                        self.i += 1;
+                        if n == '\\' {
+                            if let Some(m) = self.peek() {
+                                out.push(m);
+                                self.i += 1;
+                            }
+                            continue;
+                        }
+                        if n == '"' {
+                            break;
+                        }
+                    }
+                }
+                '\\' => {
+                    out.push(c);
+                    self.i += 1;
+                    if let Some(n) = self.peek() {
+                        out.push(n);
+                        self.i += 1;
+                    }
+                }
+                '(' => {
+                    out.push(c);
+                    self.i += 1;
+                    depth += 1;
+                }
+                ')' => {
+                    out.push(c);
+                    self.i += 1;
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {
+                    out.push(c);
+                    self.i += 1;
+                }
+            }
+        }
+        out
     }
 
     fn read_balanced_paren(&mut self) -> String {
@@ -830,19 +933,35 @@ impl Parser {
 }
 
 fn is_assignment(w: &str) -> bool {
-    if let Some(eq) = w.find('=') {
-        if eq == 0 {
+    // Forms: name=val, name+=val, name[sub]=val, name[sub]+=val, name=( … ), name+=( … ).
+    let eq = match w.find('=') {
+        Some(0) | None => return false,
+        Some(e) => e,
+    };
+    // The left side is everything before '='; strip a trailing '+' (for +=).
+    let mut lhs = &w[..eq];
+    if let Some(stripped) = lhs.strip_suffix('+') {
+        lhs = stripped;
+    }
+    // Optional `[subscript]` suffix.
+    let name = if let Some(br) = lhs.find('[') {
+        if !lhs.ends_with(']') {
             return false;
         }
-        let name = &w[..eq];
-        return name.chars().enumerate().all(|(i, c)| {
-            c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
-        });
+        &lhs[..br]
+    } else {
+        lhs
+    };
+    if name.is_empty() {
+        return false;
     }
-    false
+    name.chars()
+        .enumerate()
+        .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
 }
 
 fn split_assignment(w: &str) -> (String, String) {
+    // The key retains any `[subscript]` and a trailing `+` (append), decoded later in exec.
     let eq = w.find('=').unwrap();
     (w[..eq].to_string(), w[eq + 1..].to_string())
 }

@@ -100,7 +100,21 @@ fn cmd_export(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
 
 fn cmd_unset(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
     for a in args {
+        if a == "-v" || a == "-f" {
+            continue;
+        }
+        // unset arr[i] / unset arr[key] removes one element; unset name removes the whole var.
+        if let Some(br) = a.find('[') {
+            if a.ends_with(']') {
+                let name = &a[..br];
+                let key = &a[br + 1..a.len() - 1];
+                let key = key.trim_matches('"').trim_matches('\'');
+                interp.array_unset_elem(name, key);
+                continue;
+            }
+        }
         interp.vars.remove(a);
+        interp.arrays.remove(a);
         interp.exported.remove(a);
         interp.funcs.remove(a);
     }
@@ -156,17 +170,104 @@ fn cmd_set(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_declare(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_declare(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+    let mut assoc = false;
+    let mut indexed = false;
+    let mut print = false;
     for a in args {
-        if a.starts_with('-') {
+        if a == "--" {
             continue;
         }
-        if let Some((k, v)) = a.split_once('=') {
-            let v = v.trim_matches('"').trim_matches('\'');
-            interp.set_var(k, v);
+        if a.starts_with('-') && a.len() > 1 {
+            assoc |= a.contains('A');
+            indexed |= a.contains('a');
+            print |= a.contains('p');
+            continue;
+        }
+        // operand: NAME, NAME=value, NAME=( … ), NAME[sub]=value
+        let name = declare_name_of(a);
+        // Establish the array kind first so a following literal lands in the right store.
+        if assoc {
+            interp.declare_assoc(name);
+        } else if indexed {
+            interp.declare_indexed(name);
+        }
+        if print {
+            print_declared(interp, name, io);
+            continue;
+        }
+        if let Some((raw_key, raw_val)) = split_decl_assign(a) {
+            // Array literals / subscripts arrive verbatim (unexpanded) and are parsed by
+            // apply_assignment; plain scalars already had argv expansion, so just store them.
+            if crate::exec::is_array_assign_word(a) {
+                crate::exec::apply_assignment(interp, &raw_key, &raw_val);
+            } else {
+                let v = raw_val.trim_matches('"').trim_matches('\'');
+                interp.set_var(&raw_key, v);
+            }
         }
     }
     0
+}
+
+/// The bare variable name of a declare operand (`NAME`, `NAME=…`, `NAME[i]=…`, `NAME+=…`).
+fn declare_name_of(a: &str) -> &str {
+    let lhs = a.split('=').next().unwrap_or(a);
+    let lhs = lhs.strip_suffix('+').unwrap_or(lhs);
+    match lhs.find('[') {
+        Some(i) => &lhs[..i],
+        None => lhs,
+    }
+}
+
+/// Split a declare operand into (raw_key, raw_val) preserving `[sub]` / `+` markers, or None
+/// when there's no `=`.
+fn split_decl_assign(a: &str) -> Option<(String, String)> {
+    let eq = a.find('=')?;
+    Some((a[..eq].to_string(), a[eq + 1..].to_string()))
+}
+
+fn print_declared(interp: &Interp, name: &str, io: &mut Io) {
+    use crate::interp::ArrayVal;
+    match interp.arrays.get(name) {
+        Some(ArrayVal::Indexed(_)) => {
+            let mut s = String::from("declare -a ");
+            s.push_str(name);
+            s.push_str("=(");
+            let parts: Vec<String> = interp
+                .array_keys(name)
+                .into_iter()
+                .map(|k| {
+                    let v = interp.array_get(name, &k).unwrap_or_default();
+                    format!("[{k}]=\"{v}\"")
+                })
+                .collect();
+            s.push_str(&parts.join(" "));
+            s.push(')');
+            wln(io.out, &s);
+        }
+        Some(ArrayVal::Assoc(_)) => {
+            let mut s = String::from("declare -A ");
+            s.push_str(name);
+            s.push_str("=(");
+            let parts: Vec<String> = interp
+                .array_keys(name)
+                .into_iter()
+                .map(|k| {
+                    let v = interp.array_get(name, &k).unwrap_or_default();
+                    format!("[{k}]=\"{v}\"")
+                })
+                .collect();
+            s.push_str(&parts.join(" "));
+            s.push(')');
+            wln(io.out, &s);
+        }
+        None => {
+            if let Some(v) = interp.get_var(name) {
+                wln(io.out, &format!("declare -- {name}=\"{v}\""));
+            }
+        }
+    }
 }
 
 fn cmd_source(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
@@ -300,24 +401,24 @@ fn num(s: &str) -> i64 {
 }
 
 fn cmd_read(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
-    let (_flags, ops, _long) = split_flags(args);
+    let (flags, ops, _long) = split_flags(args);
+    // `read -a arr`: split the line into an indexed array (the name follows `-a`).
+    if flags.contains(&'a') {
+        let line = read_one_line(interp, io);
+        let Some(line) = line else { return 1 };
+        let arr = ops.first().map(|s| s.as_str()).unwrap_or("REPLY");
+        let ifs = interp.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+        let elems: Vec<String> = if ifs.is_empty() {
+            vec![line]
+        } else {
+            line.split(|c| ifs.contains(c)).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+        };
+        interp.set_array(arr, elems);
+        return 0;
+    }
     // Obtain a line: from explicit stdin (pipe) if present, else from the persistent input
     // cursor (set up by a `< file` redirect on an enclosing loop).
-    let line: String = if !io.stdin.is_empty() {
-        String::from_utf8_lossy(&io.stdin).lines().next().unwrap_or("").to_string()
-    } else if interp.input_pos < interp.input_stream.len() {
-        let rest = &interp.input_stream[interp.input_pos..];
-        let nl = rest.iter().position(|&b| b == b'\n');
-        let (line_bytes, adv) = match nl {
-            Some(i) => (&rest[..i], i + 1),
-            None => (rest, rest.len()),
-        };
-        let l = String::from_utf8_lossy(line_bytes).into_owned();
-        interp.input_pos += adv;
-        l
-    } else {
-        return 1; // EOF
-    };
+    let Some(line) = read_one_line(interp, io) else { return 1 };
 
     let ifs = interp.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
     if ops.is_empty() {
@@ -338,6 +439,26 @@ fn cmd_read(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
         }
     }
     0
+}
+
+/// Read one line for `read`: from an explicit stdin pipe if present, else the persistent input
+/// cursor (a `< file` redirect on an enclosing loop). Returns None at EOF.
+fn read_one_line(interp: &mut Interp, io: &Io) -> Option<String> {
+    if !io.stdin.is_empty() {
+        return Some(String::from_utf8_lossy(&io.stdin).lines().next().unwrap_or("").to_string());
+    }
+    if interp.input_pos < interp.input_stream.len() {
+        let rest = &interp.input_stream[interp.input_pos..];
+        let nl = rest.iter().position(|&b| b == b'\n');
+        let (line_bytes, adv) = match nl {
+            Some(i) => (&rest[..i], i + 1),
+            None => (rest, rest.len()),
+        };
+        let l = String::from_utf8_lossy(line_bytes).into_owned();
+        interp.input_pos += adv;
+        return Some(l);
+    }
+    None
 }
 
 fn cmd_which(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {

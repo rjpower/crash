@@ -10,6 +10,9 @@ struct Part {
     text: String,
     quoted: bool,
     has_glob: bool,
+    /// Force a field boundary before this part (used by `"${arr[@]}"` to keep elements as
+    /// separate words even though each is individually quoted).
+    field_break: bool,
 }
 
 pub fn expand_word(interp: &mut Interp, word: &str, do_split_glob: bool) -> Vec<String> {
@@ -33,6 +36,11 @@ fn assemble(interp: &mut Interp, parts: Vec<Part>, do_split_glob: bool) -> Vec<S
     let mut cur_glob = false;
     let mut started = false;
     for p in parts {
+        if p.field_break && started {
+            fields.push((std::mem::take(&mut cur), cur_glob));
+            cur_glob = false;
+            started = false;
+        }
         if p.quoted || !do_split_glob {
             cur.push_str(&p.text);
             started = true;
@@ -84,7 +92,7 @@ fn expand_to_parts(interp: &mut Interp, word: &str) -> Vec<Part> {
     macro_rules! flush_unquoted {
         () => {
             if !buf.is_empty() {
-                parts.push(Part { text: std::mem::take(&mut buf), quoted: false, has_glob: buf_glob });
+                parts.push(Part { text: std::mem::take(&mut buf), quoted: false, has_glob: buf_glob, field_break: false });
                 buf_glob = false;
             }
         };
@@ -118,16 +126,26 @@ fn expand_to_parts(interp: &mut Interp, word: &str) -> Vec<Part> {
                 let s: String = chars[start..i].iter().collect();
                 i += 1; // closing
                 flush_unquoted!();
-                parts.push(Part { text: s, quoted: true, has_glob: false });
+                parts.push(Part { text: s, quoted: true, has_glob: false, field_break: false });
             }
             '"' => {
                 i += 1;
-                let (text, consumed) = expand_double(interp, &chars[i..]);
+                let (dparts, consumed) = expand_double(interp, &chars[i..]);
                 i += consumed;
                 flush_unquoted!();
-                parts.push(Part { text, quoted: true, has_glob: false });
+                parts.extend(dparts);
             }
             '$' => {
+                // `${arr[@]}` / `${arr[*]}` unquoted: elements joined by a space, then the
+                // surrounding IFS word-splitting turns them into separate fields.
+                if let Some((words, consumed)) = try_array_words(interp, &chars[i..], false) {
+                    i += consumed;
+                    if !buf.is_empty() {
+                        buf.push(' ');
+                    }
+                    buf.push_str(&words.join(" "));
+                    continue;
+                }
                 let (val, consumed, _glob) = expand_dollar(interp, &chars[i..], false);
                 i += consumed;
                 buf.push_str(&val);
@@ -160,16 +178,24 @@ fn expand_to_parts(interp: &mut Interp, word: &str) -> Vec<Part> {
         }
     }
     if !buf.is_empty() {
-        parts.push(Part { text: buf, quoted: false, has_glob: buf_glob });
+        parts.push(Part { text: buf, quoted: false, has_glob: buf_glob, field_break: false });
     }
     parts
 }
 
 /// Expand the inside of a double-quoted string until the closing quote.
-/// Returns (expanded_text, chars_consumed_including_closing_quote).
-fn expand_double(interp: &mut Interp, chars: &[char]) -> (String, usize) {
+/// Returns (quoted parts, chars_consumed_including_closing_quote). Normally this is a single
+/// part, but `"${arr[@]}"` expands to one quoted part per element (like `"$@"`), so the result
+/// can hold several parts (the surrounding text merges with the first/last as in bash).
+fn expand_double(interp: &mut Interp, chars: &[char]) -> (Vec<Part>, usize) {
+    let mut parts: Vec<Part> = Vec::new();
     let mut out = String::new();
     let mut i = 0;
+    // Track whether the quoted string ever contributed literal text or an array element, so a
+    // sole empty `"${arr[@]}"` yields zero fields (rather than one empty field).
+    let mut any_content = false;
+    // Whether the field currently accumulating in `out` should start a new word.
+    let mut cur_break = false;
     while i < chars.len() {
         let c = chars[i];
         match c {
@@ -192,8 +218,33 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (String, usize) {
                 }
             }
             '$' => {
+                // `"${arr[@]}"` / `"${arr[*]}"`: splice each element as its own field, with the
+                // preceding text joined to the first element and following text to the last.
+                if let Some((words, consumed)) = try_array_words(interp, &chars[i..], true) {
+                    i += consumed;
+                    if !words.is_empty() {
+                        any_content = true;
+                        for (k, wv) in words.into_iter().enumerate() {
+                            if k == 0 {
+                                out.push_str(&wv);
+                            } else {
+                                // close current field, then begin a fresh word for this element
+                                parts.push(Part {
+                                    text: std::mem::take(&mut out),
+                                    quoted: true,
+                                    has_glob: false,
+                                    field_break: cur_break,
+                                });
+                                cur_break = true;
+                                out.push_str(&wv);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let (val, consumed, _) = expand_dollar(interp, &chars[i..], true);
                 out.push_str(&val);
+                any_content = true;
                 i += consumed;
             }
             '`' => {
@@ -205,14 +256,119 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (String, usize) {
                 let cmd: String = chars[start..i].iter().collect();
                 i += 1;
                 out.push_str(&run_capture(interp, &cmd));
+                any_content = true;
             }
             _ => {
                 out.push(c);
+                any_content = true;
                 i += 1;
             }
         }
     }
-    (out, i)
+    if !any_content && parts.is_empty() && out.is_empty() {
+        // sole empty array expansion → zero fields
+        return (Vec::new(), i);
+    }
+    parts.push(Part { text: out, quoted: true, has_glob: false, field_break: cur_break });
+    (parts, i)
+}
+
+/// If the `$...` at `chars` is a multi-valued array expansion (`${arr[@]}`, `${arr[*]}`,
+/// `${!arr[@]}`, `${!arr[*]}`, or an `@`/`*` slice), return the element/key list and the number
+/// of chars consumed. Returns `None` for everything else (handled by `expand_dollar`).
+fn try_array_words(interp: &mut Interp, chars: &[char], quoted: bool) -> Option<(Vec<String>, usize)> {
+    if chars.first() != Some(&'$') || chars.get(1) != Some(&'{') {
+        return None;
+    }
+    let (inner, consumed) = read_balanced(&chars[1..], '{', '}');
+    let total = 1 + consumed;
+
+    // ${!name[@]} / ${!name[*]} → keys/indices
+    let (want_keys, body) = match inner.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, inner.as_str()),
+    };
+    // Need a subscripted name: name[ @ | * ] possibly followed by a slice `:a:b`.
+    let br = body.find('[')?;
+    let name = &body[..br];
+    if name.is_empty() || !is_name(name) {
+        return None;
+    }
+    let after = &body[br + 1..];
+    // subscript up to ']'
+    let close = after.find(']')?;
+    let sub = &after[..close];
+    let tail = &after[close + 1..]; // e.g. ":1:2"
+    if sub != "@" && sub != "*" {
+        return None;
+    }
+    if !interp.is_array(name) {
+        // not an array: @/* on a scalar yields the scalar (if set) as one element
+        return match interp.get_var(name) {
+            Some(v) if !v.is_empty() => Some((vec![v], total)),
+            _ => Some((Vec::new(), total)),
+        };
+    }
+    let mut items = if want_keys {
+        interp.array_keys(name)
+    } else {
+        interp.array_all(name)
+    };
+    // optional slice `:offset:len` or `:offset`
+    if let Some(spec) = tail.strip_prefix(':') {
+        let (off, len) = parse_slice(interp, spec);
+        let n = items.len() as i64;
+        let start = if off < 0 { (n + off).max(0) } else { off.min(n) } as usize;
+        items = items.into_iter().skip(start).collect();
+        if let Some(l) = len {
+            let l = if l < 0 { (items.len() as i64 + l).max(0) } else { l } as usize;
+            items.truncate(l);
+        }
+    }
+    // For `${arr[*]}` (unquoted) bash joins with IFS[0]; but the caller's word-splitting will
+    // re-split anyway, so returning the elements is equivalent except inside quotes. When
+    // quoted and `*`, join into a single element with IFS first char.
+    if quoted && sub == "*" {
+        let ifs = interp.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+        let sep = ifs.chars().next().unwrap_or(' ').to_string();
+        return Some((vec![items.join(&sep)], total));
+    }
+    Some((items, total))
+}
+
+fn is_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+}
+
+/// Parse a slice spec `offset[:len]` (each an arithmetic expression). A leading space before a
+/// negative offset (`${arr[@]: -1}`) is allowed.
+fn parse_slice(interp: &mut Interp, spec: &str) -> (i64, Option<i64>) {
+    match spec.split_once(':') {
+        Some((a, b)) => (eval_arith(interp, a.trim()), Some(eval_arith(interp, b.trim()))),
+        None => (eval_arith(interp, spec.trim()), None),
+    }
+}
+
+/// Expand only the `$…`/`${…}`/`$(…)` substitutions in an arithmetic expression, leaving
+/// operators, numbers and bare identifiers untouched (those are resolved by the arith parser).
+fn expand_arith_subs(interp: &mut Interp, expr: &str) -> String {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            let (val, consumed, _) = expand_dollar(interp, &chars[i..], true);
+            out.push_str(&val);
+            i += consumed;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Expand a `$...` starting at chars[0] == '$'. Returns (value, consumed, was_glob).
@@ -223,9 +379,11 @@ fn expand_dollar(interp: &mut Interp, chars: &[char], _in_quotes: bool) -> (Stri
     match chars[1] {
         '(' => {
             if chars.get(2) == Some(&'(') {
-                // arithmetic $(( ))
+                // arithmetic $(( )): first expand `$…`/`${…}` substitutions (so `${arr[i]}`,
+                // `${m[k]}` and `$var` resolve), then evaluate the resulting expression.
                 let (inner, consumed) = read_double_paren(&chars[1..]);
-                let val = eval_arith(interp, &inner);
+                let expanded = expand_arith_subs(interp, &inner);
+                let val = eval_arith(interp, &expanded);
                 (val.to_string(), 1 + consumed, false)
             } else {
                 let (inner, consumed) = read_balanced(&chars[1..], '(', ')');
@@ -267,15 +425,42 @@ fn expand_dollar(interp: &mut Interp, chars: &[char], _in_quotes: bool) -> (Stri
     }
 }
 
-/// Handle the inside of `${...}`: name plus optional operator.
+/// Handle the inside of `${...}`: name plus optional operator. Single-valued result (the
+/// multi-valued `@`/`*` array forms are intercepted earlier by `try_array_words`).
 fn expand_param(interp: &mut Interp, inner: &str) -> String {
-    // ${#name}
+    // ${#name} / ${#name[@]} / ${#name[idx]}
     if let Some(rest) = inner.strip_prefix('#') {
+        if let Some((name, sub)) = parse_subscript(rest) {
+            if sub == "@" || sub == "*" {
+                return interp.array_len(name).to_string();
+            }
+            let key = expand_word(interp, sub, false).join(" ");
+            let v = interp.array_get(name, &key).unwrap_or_default();
+            return v.chars().count().to_string();
+        }
+        // ${#@} → number of positional params; ${#var} → length
+        if rest == "@" || rest == "*" {
+            return interp.positional.len().to_string();
+        }
         let v = interp.get_var(rest).unwrap_or_default();
         return v.chars().count().to_string();
     }
+    // ${!name[@]} keys handled by try_array_words; here support ${!name} indirection minimally.
+    // Subscripted reference: ${name[subscript]}[op...]
+    if let Some((name, sub, tail)) = parse_subscript_tail(inner) {
+        let key = expand_word(interp, sub, false).join(" ");
+        let cur = if sub == "@" || sub == "*" {
+            // single-valued context (e.g. inside $(...)): join with space
+            Some(interp.array_all(name).join(" "))
+        } else {
+            interp.array_get(name, &key)
+        };
+        if tail.is_empty() {
+            return cur.unwrap_or_default();
+        }
+        return apply_op_from_rest(interp, name, tail, cur);
+    }
     // find operator
-    let ops = [":-", ":=", ":+", ":?", "##", "#", "%%", "%", "//", "/", "^^", "^", ",,", ","];
     // name is leading [A-Za-z0-9_@*] run
     let name_end = inner
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '@' || c == '*'))
@@ -286,13 +471,59 @@ fn expand_param(interp: &mut Interp, inner: &str) -> String {
     if rest.is_empty() {
         return cur.unwrap_or_default();
     }
+    apply_op_from_rest(interp, name, rest, cur)
+}
+
+/// Apply the operator portion `rest` (e.g. `:-default`, `%.gz`, `:1:2`) of a `${name<rest>}`.
+fn apply_op_from_rest(interp: &mut Interp, name: &str, rest: &str, cur: Option<String>) -> String {
+    // substring slice `${var:offset:len}` (offset not one of the named ops)
+    let ops = [":-", ":=", ":+", ":?", "##", "#", "%%", "%", "//", "/", "^^", "^", ",,", ","];
     for op in ops {
         if let Some(arg) = rest.strip_prefix(op) {
             let arg_expanded = expand_word(interp, arg, false).join(" ");
             return apply_param_op(interp, name, op, &arg_expanded, cur);
         }
     }
+    if let Some(spec) = rest.strip_prefix(':') {
+        // substring expansion ${var:offset:len}
+        let v = cur.unwrap_or_default();
+        let (off, len) = parse_slice(interp, spec);
+        let chars: Vec<char> = v.chars().collect();
+        let n = chars.len() as i64;
+        let start = if off < 0 { (n + off).max(0) } else { off.min(n) } as usize;
+        let end = match len {
+            Some(l) if l < 0 => (n + l).max(start as i64) as usize,
+            Some(l) => (start + l as usize).min(chars.len()),
+            None => chars.len(),
+        };
+        return chars[start..end.max(start)].iter().collect();
+    }
     cur.unwrap_or_default()
+}
+
+/// Parse `name[subscript]` exactly (no trailing operator). Returns (name, subscript).
+fn parse_subscript(s: &str) -> Option<(&str, &str)> {
+    let br = s.find('[')?;
+    if !s.ends_with(']') {
+        return None;
+    }
+    let name = &s[..br];
+    if !is_name(name) {
+        return None;
+    }
+    Some((name, &s[br + 1..s.len() - 1]))
+}
+
+/// Parse `name[subscript]<tail>` where tail is an optional operator. Returns (name, sub, tail).
+fn parse_subscript_tail(s: &str) -> Option<(&str, &str, &str)> {
+    let br = s.find('[')?;
+    let name = &s[..br];
+    if !is_name(name) {
+        return None;
+    }
+    // find matching ']' (subscripts here don't nest brackets in practice)
+    let close = s[br + 1..].find(']')? + br + 1;
+    Some((name, &s[br + 1..close], &s[close + 1..]))
 }
 
 fn apply_param_op(
@@ -646,6 +877,19 @@ impl ArithParser<'_> {
                     } else {
                         break;
                     }
+                }
+                // bare array subscript inside arithmetic: name[index]
+                if self.chars.get(self.i) == Some(&'[') {
+                    self.i += 1;
+                    let idx = self.expr();
+                    if self.peek() == Some(']') {
+                        self.i += 1;
+                    }
+                    return self
+                        .interp
+                        .array_get(&name, &idx.to_string())
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
                 }
                 self.interp
                     .get_var(&name)
